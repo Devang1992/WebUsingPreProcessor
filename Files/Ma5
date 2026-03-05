@@ -1,0 +1,396 @@
+Option 1 (recommended): Config-driven JSON Pointer mapping (YAML → generic mapper)
+1) Put the mapping in application.yml
+
+You define: outgoingField → JSON Pointer (source path)
+
+tdd:
+  mapping:
+    basePath: "/TDDMessage/TDDMExtended/HVP"
+    fields:
+      debitAccNo: "/DebitAccount/AccNb"
+      debitAccType: "/DebitAccount/AccType"
+      debitOffice: "/DebitAccount/Office"
+      prodCode: "/ProdCode"
+      mop: "/Mop"
+      service: "/Service"
+      extRef: "/ExtRef"
+
+So your mapper always starts at HVP, and only pulls what you list.
+
+2) Generic mapper (works with JsonNode)
+@ConfigurationProperties(prefix = "tdd.mapping")
+public class JsonMappingProps {
+  private String basePath;                 // "/TDDMessage/TDDMExtended/HVP"
+  private Map<String, String> fields = new LinkedHashMap<>(); // outgoing -> pointer
+  // getters/setters
+}
+@Component
+@EnableConfigurationProperties(JsonMappingProps.class)
+public class ConfigDrivenJsonMapper {
+
+  private final JsonMappingProps props;
+  private final ObjectMapper om;
+
+  public ConfigDrivenJsonMapper(JsonMappingProps props, ObjectMapper om) {
+    this.props = props;
+    this.om = om;
+  }
+
+  public ObjectNode map(JsonNode input) {
+    ObjectNode out = om.createObjectNode();
+
+    JsonNode hvp = input.at(props.getBasePath());
+    if (hvp.isMissingNode() || hvp.isNull()) {
+      // if you want: return empty object or throw, your call
+      return out;
+    }
+
+    props.getFields().forEach((outField, ptr) -> {
+      JsonNode v = hvp.at(ptr); // ptr is relative to HVP
+      if (!v.isMissingNode()) {
+        out.set(outField, v);   // preserves types (string/number/object/null)
+      }
+    });
+
+    return out;
+  }
+}
+3) Use it in Kafka Streams
+@Bean
+public Function<KStream<String, JsonNode>, KStream<String, JsonNode>> hvpTransform(
+    ConfigDrivenJsonMapper mapper
+) {
+  return input -> input
+      .mapValues(mapper::map);
+}
+
+✅ Pros:
+
+Pure config mapping
+
+Very fast, simple, no extra libs
+
+Keeps types correctly (string vs number vs null)
+
+Easy to add/remove fields without code changes
+
+Option 2: JOLT spec (JSON “transform language”) in resources + selectable by config
+
+If you want something more “ETL-like”, use JOLT (commonly used for JSON transforms).
+
+Example JOLT spec file hvp-mapping.json:
+
+[
+  {
+    "operation": "shift",
+    "spec": {
+      "TDDMessage": {
+        "TDDMExtended": {
+          "HVP": {
+            "DebitAccount": {
+              "AccNb": "debitAccNo",
+              "AccType": "debitAccType",
+              "Office": "debitOffice"
+            },
+            "ProdCode": "prodCode",
+            "Mop": "mop"
+          }
+        }
+      }
+    }
+  }
+]
+
+And you pick which spec to apply via YAML (per topic, per flow, etc.).
+
+✅ Pros:
+
+Transform logic is fully external spec
+
+Can do more advanced reshaping than simple “copy these paths”
+
+⚠️ Cons:
+
+Extra dependency + slightly heavier runtime
+
+Option 3: MapStruct + “partial config”
+
+If your outgoing schema is a POJO/Avro class and stable, MapStruct is great, but it’s not purely config-driven unless you build a layer on top. It’s best when the mapping is “real code”, not “editable mapping”.
+
+What I’d pick for your case
+
+If your requirement is really: “HVP contains many fields; map only selected ones to outgoing schema; change it by config only” → Option 1 (JSON Pointer mapping) is the best balance of:
+
+minimal dependencies
+
+clear config
+
+easy maintenance
+
+works perfectly with Kafka Streams + JsonNode
+
+Small extras you might need (common in real projects)
+A) Default values if missing
+
+Add in YAML:
+
+tdd:
+  mapping:
+    defaults:
+      service: "UNKNOWN"
+
+Then if missing, set default.
+
+B) Renaming + nested outgoing structure
+
+If outgoing needs nesting (e.g., account.debit.no), allow dotted keys and build nodes accordingly.
+
+C) Type coercion
+
+If some outgoing fields must be string always (even if source is numeric), add metadata:
+
+fields:
+  amount:
+    path: "/Amount"
+    type: "string"
+
+If you paste your outgoing schema fields (just the list, even 10–20 fields), I can write you the exact YAML mapping + a slightly upgraded mapper that supports:
+
+defaults
+
+required fields (fail fast)
+
+dotted output paths (nested output JSON)
+
+optional type coercion
+
+
+
+
+
+1) How to “use filter + dedupe output” in NotificationProcessor
+
+In Kafka Streams, each .process(...) receives the record after the previous processor already ran.
+
+So your NotificationProcessor just reads the record like normal.
+
+Preferred: build NotificationProcessor as a ContextualProcessor
+
+That gives you access to:
+
+headers
+
+record metadata (topic/partition/offset)
+
+forwarding to a different topic
+
+try/catch per record
+
+Example skeleton:
+
+public class NotificationProcessor extends ContextualProcessor<String, JsonNode, String, JsonNode> {
+
+  private final ConfigDrivenJsonMapper mapper; // the YAML pointer mapper
+  private final ObjectMapper om;
+
+  public NotificationProcessor(ConfigDrivenJsonMapper mapper, ObjectMapper om) {
+    this.mapper = mapper;
+    this.om = om;
+  }
+
+  @Override
+  public void process(Record<String, JsonNode> record) {
+    try {
+      JsonNode in = record.value();
+
+      // (optional) small extraction before mapping
+      // e.g. MID for logging/routing
+      String mid = in.at("/TDDMessage/TDDMExtended/HVP/Mid").asText(null);
+
+      ObjectNode out = mapper.map(in);   // config-driven field picking
+      // (optional) enrich
+      if (mid != null) out.put("mid", mid);
+
+      // forward to “success route”
+      context().forward(record.withValue(out));
+
+    } catch (Exception e) {
+      // forward to “error route” with original payload
+      ObjectNode err = buildError(record, e);
+      context().forward(record.withValue(err), To.child("error-sink"));
+      // OR: put a header and let topicNameExtractor route it
+    }
+  }
+
+  private ObjectNode buildError(Record<String, JsonNode> record, Exception e) {
+    ObjectNode err = om.createObjectNode();
+    err.put("errorType", e.getClass().getSimpleName());
+    err.put("errorMessage", safeMsg(e));
+    err.set("original", record.value()); // keep full context (or truncate if huge)
+    err.put("key", record.key());
+
+    // metadata (super useful for replay)
+    err.put("srcTopic", context().topic());
+    err.put("partition", context().partition());
+    err.put("offset", context().offset());
+
+    return err;
+  }
+
+  private String safeMsg(Exception e) {
+    String msg = e.getMessage();
+    return msg == null ? "n/a" : msg.substring(0, Math.min(msg.length(), 500));
+  }
+}
+
+Then in topology:
+
+stream = input
+  .process(FilterProcessor::new)
+  .process(dedupProcessorSupplier)
+  .process(() -> new NotificationProcessor(mapper, objectMapper),
+           Named.as("notification-transform"),
+           "error-sink"); // optional named child
+
+Important: if you use To.child("error-sink"), you need to attach sinks (see error handling section below).
+
+2) “Parsing JSON / deserializing handled automatically” — where errors actually happen
+
+Even if you’re using JsonNode, failures can happen in two places:
+
+A) At Kafka consumer deserialization
+
+This is before your topology sees the record.
+
+Fix with ErrorHandlingDeserializer (Spring Kafka)
+
+Or set Streams deserialization exception handler (Kafka Streams)
+
+B) Inside your processors
+
+null nodes
+
+missing paths
+
+type coercion (asText() on object, etc.)
+
+your custom code
+
+So you want both: a deserialization handler + processor try/catch.
+
+3) Best error-handling approach for Streams (pragmatic)
+Level 1: Deserialization handler
+
+In Streams config:
+
+If you want to skip bad records (and keep app running):
+
+default.deserialization.exception.handler = LogAndContinueExceptionHandler
+
+If you want to stop on bad records:
+
+LogAndFailExceptionHandler
+
+Spring Boot property style (example):
+
+spring:
+  kafka:
+    streams:
+      properties:
+        default.deserialization.exception.handler: org.apache.kafka.streams.errors.LogAndContinueExceptionHandler
+
+But skipping is risky unless you also emit to an error topic.
+
+If you need an error topic for deser failures, common pattern is:
+
+consume as byte[] / String
+
+parse inside processor with try/catch
+
+route to error topic yourself
+(so you never lose the raw bytes)
+
+Level 2: Processing exception handling (inside NotificationProcessor)
+
+The try/catch in process() is your “DLQ for mapping logic”.
+
+4) Routing to success vs error with your topicNameExtractor
+
+Since you’re already doing stream.to(topicNameExtractor), easiest is:
+
+A) Add a header like route=ERROR or error=true
+
+Then your topicNameExtractor decides topic by header.
+
+In processor:
+
+Headers headers = record.headers();
+headers.add("route", "ERROR".getBytes(StandardCharsets.UTF_8));
+context().forward(record.withValue(err));
+
+In extractor:
+
+if route=ERROR → notifications.error
+
+else → notifications.out
+
+This keeps topology simple: one .to(topicNameExtractor).
+
+B) Or do explicit branching
+KStream<String, JsonNode>[] branches = stream.branch(
+  (k,v) -> v.has("errorType"),
+  (k,v) -> true
+);
+
+branches[0].to("notifications.error");
+branches[1].to("notifications.out");
+
+This is super readable and avoids header games.
+
+5) “Mapping + extract some values before forwarding”
+
+You already saw the in.at("/...") approach. I recommend standardizing it:
+
+Small helper (safe extraction)
+public final class Jsons {
+  private Jsons() {}
+
+  public static String text(JsonNode n, String ptr) {
+    JsonNode v = n.at(ptr);
+    return (v.isMissingNode() || v.isNull()) ? null : v.asText();
+  }
+
+  public static Long longVal(JsonNode n, String ptr) {
+    JsonNode v = n.at(ptr);
+    return (v.isMissingNode() || v.isNull()) ? null : v.asLong();
+  }
+}
+
+Use:
+
+String mid = Jsons.text(in, "/TDDMessage/TDDMExtended/HVP/Mid");
+If you want extraction also config-driven
+
+Extend YAML:
+
+tdd:
+  mapping:
+    extract:
+      mid: "/TDDMessage/TDDMExtended/HVP/Mid"
+      mop: "/TDDMessage/TDDMExtended/HVP/Mop"
+
+Then you can add headers/fields without code changes.
+
+6) Practical “good defaults” for filter + dedupe + error flow
+
+FilterProcessor: if invalid business rule → route to error topic with reason FILTERED
+
+DedupeProcessor: duplicates → drop (or route to “duplicates” topic if you need audit)
+
+NotificationProcessor:
+
+map via config
+
+enrich with mid, eventTs
+
+exceptions → error payload (include original + metadata)
