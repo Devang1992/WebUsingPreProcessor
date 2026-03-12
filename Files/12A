@@ -1,0 +1,275 @@
+src/main/resources/jsonata/order-merge.jsonata
+
+/**
+ * order-merge.jsonata  —  your "XQuery logic file"
+ *
+ * Merges two payloads 4 levels deep:
+ *   ROOT > ORG > REGION > ORDERS
+ *
+ * Status field transformation:
+ *   PENDING   → AWAITING_PROCESSING
+ *   SHIPPED   → IN_TRANSIT
+ *   DELIVERED → COMPLETED
+ *   other     → UNKNOWN_<uppercased>
+ */
+
+/* helper: map status values */
+$statusMap := function($raw) {
+  $raw = "PENDING"   ? "AWAITING_PROCESSING" :
+  $raw = "SHIPPED"   ? "IN_TRANSIT"          :
+  $raw = "DELIVERED" ? "COMPLETED"           :
+  "UNKNOWN_" & $uppercase($raw)
+};
+
+/* helper: merge two ORDERS arrays, deduplicate by orderId.
+   payload2 wins on conflict — swap $append order to flip that. */
+$mergeOrders := function($arr1, $arr2) {(
+  $combined := $append($arr1, $arr2);
+  $ids      := $distinct($combined.orderId);
+  $ids.(
+    $id      := $;
+    $matches := $combined[orderId = $id];
+    $order   := $matches[$count($matches) - 1];
+    $merge([$order, { "status": $statusMap($order.status) }])
+  )
+)};
+
+/* main: rebuild full 4-level structure around merged array */
+{
+  "ROOT": {
+    "ORG": {
+      "REGION": {
+        "ORDERS": $mergeOrders(
+          $p1.ROOT.ORG.REGION.ORDERS,
+          $p2.ROOT.ORG.REGION.ORDERS
+        )
+      },
+      "regionCode":  $p2.ROOT.ORG.REGION.regionCode  != null
+                       ? $p2.ROOT.ORG.REGION.regionCode
+                       : $p1.ROOT.ORG.REGION.regionCode,
+      "regionLabel": $p2.ROOT.ORG.REGION.regionLabel != null
+                       ? $p2.ROOT.ORG.REGION.regionLabel
+                       : $p1.ROOT.ORG.REGION.regionLabel
+    },
+    "orgId":   $p1.ROOT.ORG.orgId,
+    "orgName": $p2.ROOT.ORG.orgName != null
+                 ? $p2.ROOT.ORG.orgName
+                 : $p1.ROOT.ORG.orgName
+  },
+  "schemaVersion": $p1.ROOT.schemaVersion,
+  "generatedAt":   $now()
+}
+
+src/main/resources/jsonata/merge-config.json
+
+{
+  "_comment": "Registry of merge specs. Add entry + .jsonata file = new merge type. No Java changes needed.",
+
+  "merges": [
+    {
+      "id": "order-merge",
+      "description": "ROOT > ORG > REGION > ORDERS — 4 levels deep",
+      "expressionFile": "order-merge.jsonata",
+      "enabled": true
+    },
+    {
+      "id": "product-merge",
+      "description": "ROOT > CATALOG > CATEGORY > ITEMS — 4 levels deep",
+      "expressionFile": "product-merge.jsonata",
+      "enabled": true
+    }
+  ]
+}
+
+
+src/main/java/.../config/MergeConfigLoader.java
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class MergeConfigLoader {
+
+    private static final String CONFIG_PATH    = "classpath:jsonata/merge-config.json";
+    private static final String JSONATA_PREFIX = "classpath:jsonata/";
+
+    private final ResourceLoader resourceLoader;
+    private final ObjectMapper   objectMapper;
+
+    /** mergeId → compiled Jsonata expression (pre-compiled at startup) */
+    @Getter
+    private final Map<String, Jsonata> compiledExpressions = new HashMap<>();
+
+    @PostConstruct
+    public void load() throws IOException {
+        Resource configResource = resourceLoader.getResource(CONFIG_PATH);
+        MergeConfig config = objectMapper.readValue(
+            configResource.getInputStream(), MergeConfig.class);
+
+        for (MergeConfig.MergeDefinition def : config.getMerges()) {
+            if (!def.isEnabled()) { continue; }
+
+            Resource exprResource = resourceLoader.getResource(
+                JSONATA_PREFIX + def.getExpressionFile());
+
+            String expression = new String(
+                exprResource.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+
+            // Strip block comments — JSONata parser doesn't support /* */
+            String cleaned = expression.replaceAll("/\\*[\\s\\S]*?\\*/", "").trim();
+
+            compiledExpressions.put(def.getId(), Jsonata.jsonata(cleaned));
+            log.info("Loaded: '{}' ({})", def.getId(), def.getExpressionFile());
+        }
+    }
+
+    public Jsonata getExpression(String mergeId) {
+        Jsonata expr = compiledExpressions.get(mergeId);
+        if (expr == null) throw new IllegalArgumentException(
+            "No merge expression for id: '" + mergeId + "'");
+        return expr;
+    }
+}
+
+
+src/main/java/.../service/JsonataMergeService.java
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class JsonataMergeService {
+
+    private final MergeConfigLoader configLoader;
+    private final ObjectMapper      objectMapper;
+
+    public JsonNode merge(MergeRequest request) {
+        Jsonata expression = configLoader.getExpression(request.getMergeId());
+
+        // JSONata-java needs plain Maps, not JsonNode
+        Object p1 = toPlainObject(request.getPayload1());
+        Object p2 = toPlainObject(request.getPayload2());
+
+        // $p1 and $p2 are always available in every .jsonata file
+        Map<String, Object> bindings = new LinkedHashMap<>();
+        bindings.put("p1", p1);
+        bindings.put("p2", p2);
+
+        // Caller can pass extra vars e.g. { "currencyMultiplier": 1.32 }
+        // These become $currencyMultiplier inside the .jsonata expression
+        if (request.getBindings() != null) {
+            bindings.putAll(request.getBindings());
+        }
+
+        try {
+            bindings.forEach((k, v) -> {
+                try { expression.assign(k, v); }
+                catch (Exception e) {
+                    throw new RuntimeException("Failed to bind $" + k, e);
+                }
+            });
+
+            // null root context — expressions use $p1/$p2 bindings
+            Object result = expression.evaluate(null);
+            return objectMapper.valueToTree(result);
+
+        } catch (Exception e) {
+            log.error("Evaluation failed for '{}': {}", request.getMergeId(), e.getMessage());
+            throw new RuntimeException("Merge evaluation failed", e);
+        }
+    }
+
+    private Object toPlainObject(JsonNode node) {
+        if (node == null) return null;
+        return objectMapper.convertValue(node, Object.class);
+    }
+}
+
+src/main/java/.../model/MergeRequest.java
+
+@Data
+public class MergeRequest {
+    /** Must match an 'id' in merge-config.json */
+    private String mergeId;
+
+    private JsonNode payload1;
+    private JsonNode payload2;
+
+    /**
+     * Optional runtime bindings passed into the JSONata expression.
+     * e.g. { "currencyMultiplier": 1.32 }
+     * → accessible as $currencyMultiplier inside the .jsonata file
+     */
+    private Map<String, Object> bindings;
+}
+
+src/test/java/.../MergeServiceTest.java
+@SpringBootTest
+class JsonataMergeServiceTest {
+
+    @Autowired JsonataMergeService mergeService;
+    @Autowired ObjectMapper objectMapper;
+
+    static final String PAYLOAD_1 = """
+        {
+          "ROOT": { "schemaVersion": "1.0",
+            "ORG": { "orgId": "ORG-001", "orgName": "ACME Corp",
+              "REGION": { "regionCode": "NA",
+                "ORDERS": [
+                  { "orderId": "ORD-123", "amount": 99.99,  "status": "PENDING" },
+                  { "orderId": "ORD-456", "amount": 250.00, "status": "SHIPPED" }
+                ]
+              }
+            }
+          }
+        }""";
+
+    static final String PAYLOAD_2 = """
+        {
+          "ROOT": { "schemaVersion": "1.0",
+            "ORG": { "orgId": "ORG-001", "orgName": "ACME Corp",
+              "REGION": { "regionCode": "NA",
+                "ORDERS": [
+                  { "orderId": "ORD-789", "amount": 45.00,  "status": "DELIVERED" },
+                  { "orderId": "ORD-456", "amount": 260.00, "status": "SHIPPED"   }
+                ]
+              }
+            }
+          }
+        }""";
+
+    @Test
+    void mergesCombinesUniqueOrders() throws Exception {
+        MergeRequest req = new MergeRequest();
+        req.setMergeId("order-merge");
+        req.setPayload1(objectMapper.readTree(PAYLOAD_1));
+        req.setPayload2(objectMapper.readTree(PAYLOAD_2));
+
+        JsonNode result  = mergeService.merge(req);
+        JsonNode orders  = result.at("/ROOT/ORG/REGION/ORDERS");
+
+        // 3 unique orders: ORD-123, ORD-456 (deduplicated), ORD-789
+        assertThat(orders.size()).isEqualTo(3);
+    }
+
+    @Test
+    void statusFieldIsTransformed() throws Exception {
+        MergeRequest req = new MergeRequest();
+        req.setMergeId("order-merge");
+        req.setPayload1(objectMapper.readTree(PAYLOAD_1));
+        req.setPayload2(objectMapper.readTree(PAYLOAD_2));
+
+        JsonNode orders = mergeService.merge(req).at("/ROOT/ORG/REGION/ORDERS");
+
+        assertThat(findOrder(orders,"ORD-123").get("status").asText())
+            .isEqualTo("AWAITING_PROCESSING");   // PENDING →
+        assertThat(findOrder(orders,"ORD-456").get("status").asText())
+            .isEqualTo("IN_TRANSIT");            // SHIPPED →
+        assertThat(findOrder(orders,"ORD-789").get("status").asText())
+            .isEqualTo("COMPLETED");             // DELIVERED →
+    }
+
+    private JsonNode findOrder(JsonNode orders, String id) {
+        for (JsonNode o : orders)
+            if (id.equals(o.path("orderId").asText())) return o;
+        throw new AssertionError("Order not found: " + id);
+    }
+}
