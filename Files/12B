@@ -1,0 +1,455 @@
+src/main/resources/jsonata/customer-hvp-merge.jsonata
+
+$hvpMerged := $merge([
+    $p1.customer.account.profile.HVP,
+    $p2.customer.account.profile.HVP,
+    {
+        "contactDetails": $merge([
+            $p1.customer.account.profile.HVP.contactDetails,
+            $p2.customer.account.profile.HVP.contactDetails
+        ])
+    }
+]);
+
+$referenceData := $hvpMerged.referenceData;
+
+$routingKey := $p1.customer.account.routingConfig.indicator;
+
+$routingMap := {
+    "BILL":   { "section": "billingProfile",  "field": "rateCode"      },
+    "PRICE":  { "section": "pricingProfile",  "field": "priceCode"     },
+    "RISK":   { "section": "riskProfile",     "field": "riskIndicator" }
+};
+
+$route := $lookup($routingMap, $routingKey);
+
+$merge([
+    $p1,
+    {
+        "customer": $merge([
+            $p1.customer,
+            {
+                "account": $merge([
+                    $p1.customer.account,
+                    {
+                        "profile": $merge([
+                            $p1.customer.account.profile,
+                            { "HVP": $hvpMerged }
+                        ]),
+                        "billingProfile": $merge([
+                            $p1.customer.account.billingProfile,
+                            $route.section = "billingProfile"
+                                ? { ($route.field): $referenceData }
+                                : {}
+                        ]),
+                        "pricingProfile": $merge([
+                            $p1.customer.account.pricingProfile,
+                            $route.section = "pricingProfile"
+                                ? { ($route.field): $referenceData }
+                                : {}
+                        ]),
+                        "riskProfile": $merge([
+                            $p1.customer.account.riskProfile,
+                            $route.section = "riskProfile"
+                                ? { ($route.field): $referenceData }
+                                : {}
+                        ])
+                    }
+                ])
+            }
+        ])
+    }
+])
+
+src/main/resources/jsonata/merge-config.json
+
+{
+  "_comment": "Add entry + .jsonata file = new merge type. Zero Java changes.",
+  "merges": [
+    {
+      "id": "customer-hvp-merge",
+      "description": "Merges HVP from p2 into full p1. Routes HVP.referenceData to target field based on routingConfig.indicator.",
+      "expressionFile": "customer-hvp-merge.jsonata",
+      "enabled": true
+    }
+  ]
+}
+
+src/main/java/com/example/merger/config/MergeConfig.java
+package com.example.merger.config;
+
+import lombok.Data;
+import java.util.List;
+
+/**
+ * Maps to merge-config.json.
+ * Add entry in JSON + new .jsonata = new merge type. No Java changes.
+ */
+@Data
+public class MergeConfig {
+
+    private List<MergeDefinition> merges;
+
+    @Data
+    public static class MergeDefinition {
+        /** Unique ID — must match MergeRequest.mergeId */
+        private String  id;
+        private String  description;
+        /** Filename under src/main/resources/jsonata/ */
+        private String  expressionFile;
+        private boolean enabled;
+    }
+}
+
+src/main/java/com/example/merger/config/MergeConfigLoader.java
+
+package com.example.merger.config;
+
+import com.dashjoin.jsonata.Jsonata;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.core.io.Resource;
+import org.springframework.core.io.ResourceLoader;
+import org.springframework.stereotype.Component;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class MergeConfigLoader {
+
+    private static final String CONFIG_PATH    = "classpath:jsonata/merge-config.json";
+    private static final String JSONATA_PREFIX = "classpath:jsonata/";
+
+    private final ResourceLoader resourceLoader;
+    private final ObjectMapper   objectMapper;
+
+    /** mergeId -> pre-compiled Jsonata expression */
+    @Getter
+    private final Map<String, Jsonata> compiledExpressions = new HashMap<>();
+
+    @PostConstruct
+    public void load() throws IOException {
+        MergeConfig config = objectMapper.readValue(
+            resourceLoader.getResource(CONFIG_PATH).getInputStream(),
+            MergeConfig.class
+        );
+
+        for (MergeConfig.MergeDefinition def : config.getMerges()) {
+            if (!def.isEnabled()) { log.info("Skipping disabled: {}", def.getId()); continue; }
+
+            Resource res = resourceLoader.getResource(JSONATA_PREFIX + def.getExpressionFile());
+            if (!res.exists()) { log.warn("Missing file for '{}': {}", def.getId(), def.getExpressionFile()); continue; }
+
+            String raw     = new String(res.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+            String cleaned = raw.replaceAll("/\*[\s\S]*?\*/", "").trim();
+
+            compiledExpressions.put(def.getId(), Jsonata.jsonata(cleaned));
+            log.info("Loaded: '{}' <- {}", def.getId(), def.getExpressionFile());
+        }
+        log.info("JSONata loader ready — {} expression(s)", compiledExpressions.size());
+    }
+
+    public Jsonata getExpression(String mergeId) {
+        Jsonata expr = compiledExpressions.get(mergeId);
+        if (expr == null) throw new IllegalArgumentException(
+            "No expression for mergeId: '" + mergeId + "'. Check merge-config.json.");
+        return expr;
+    }
+}
+
+
+
+src/main/java/com/example/merger/model/MergeRequest.java
+
+package com.example.merger.model;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import lombok.Data;
+import java.util.Map;
+
+@Data
+public class MergeRequest {
+
+    /** Must match an 'id' in merge-config.json */
+    private String mergeId;
+
+    /** Full payload — base for everything outside HVP */
+    private JsonNode payload1;
+
+    /**
+     * Same schema as payload1 but only HVP is populated.
+     * All null/empty fields outside HVP are ignored.
+     */
+    private JsonNode payload2;
+
+    /**
+     * Optional extra variables injected into the JSONata expression.
+     * E.g. { "currencyMultiplier": 1.32 } -> $currencyMultiplier in .jsonata
+     */
+    private Map<String, Object> bindings;
+}
+
+src/main/java/com/example/merger/model/MergeResponse.java
+package com.example.merger.model;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+
+@Data
+@AllArgsConstructor
+public class MergeResponse {
+    /** The mergeId that was executed — useful for logging/tracing */
+    private String mergeId;
+
+    /** The fully merged payload */
+    private JsonNode result;
+}
+
+src/main/java/com/example/merger/service/JsonataMergeService.java
+package com.example.merger.service;
+
+import com.dashjoin.jsonata.Jsonata;
+import com.example.merger.config.MergeConfigLoader;
+import com.example.merger.model.MergeRequest;
+import com.example.merger.model.MergeResponse;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class JsonataMergeService {
+
+    private final MergeConfigLoader configLoader;
+    private final ObjectMapper      objectMapper;
+
+    public MergeResponse merge(MergeRequest request) {
+        log.debug("Starting merge for id='{}'", request.getMergeId());
+
+        Jsonata expression = configLoader.getExpression(request.getMergeId());
+
+        // JSONata-java needs plain Maps, not JsonNode
+        Map<String, Object> bindings = new LinkedHashMap<>();
+        bindings.put("p1", toPlainObject(request.getPayload1())); // -> $p1
+        bindings.put("p2", toPlainObject(request.getPayload2())); // -> $p2
+
+        if (request.getBindings() != null) bindings.putAll(request.getBindings());
+
+        try {
+            bindings.forEach((key, value) -> {
+                try { expression.assign(key, value); }
+                catch (Exception e) {
+                    throw new RuntimeException("Failed to bind $" + key, e);
+                }
+            });
+
+            Object    raw    = expression.evaluate(null); // null = no root context
+            JsonNode  result = objectMapper.valueToTree(raw);
+
+            log.debug("Merge complete for id='{}'", request.getMergeId());
+            return new MergeResponse(request.getMergeId(), result);
+
+        } catch (Exception e) {
+            log.error("Evaluation failed for '{}': {}", request.getMergeId(), e.getMessage(), e);
+            throw new RuntimeException("Merge evaluation failed: " + e.getMessage(), e);
+        }
+    }
+
+    private Object toPlainObject(JsonNode node) {
+        return node == null ? null : objectMapper.convertValue(node, Object.class);
+    }
+}
+
+
+src/test/java/com/example/merger/CustomerHvpMergeTest.java
+
+package com.example.merger;
+
+import com.example.merger.model.MergeRequest;
+import com.example.merger.model.MergeResponse;
+import com.example.merger.service.JsonataMergeService;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+@SpringBootTest
+class CustomerHvpMergeTest {
+
+    @Autowired JsonataMergeService mergeService;
+    @Autowired ObjectMapper        objectMapper;
+
+    static final String P1_BILL = """
+        {
+          "customer": {
+            "customerId": "CUST-0042", "customerType": "RETAIL",
+            "account": {
+              "accountId": "ACC-9981", "status": "ACTIVE",
+              "routingConfig": { "indicator": "BILL", "configVersion": "v2" },
+              "profile": {
+                "profileId": "PROF-771", "tier": "GOLD",
+                "HVP": {
+                  "name": "Jane Doe", "referenceData": "OLD-REF",
+                  "contactDetails": { "phone": "555-1234", "preferredContact": "PHONE" }
+                }
+              },
+              "billingProfile": { "billingId":"BILL-441","rateCode":"STALE-RATE","paymentMethod":"DIRECT_DEBIT","currency":"GBP" },
+              "pricingProfile": { "pricingId":"PRICE-99","priceCode":"TIER-A","discount":0.10 },
+              "riskProfile":    { "riskId":"RISK-77","riskIndicator":"LOW","reviewDate":"2025-06-01" }
+            },
+            "metadata": { "createdBy": "system", "flags": ["VERIFIED","OPTED_IN"] }
+          }
+        }""";
+
+    static final String P2 = """
+        {
+          "customer": {
+            "customerId": null, "customerType": null,
+            "account": {
+              "accountId": null, "status": null, "routingConfig": null,
+              "profile": {
+                "profileId": null, "tier": null,
+                "HVP": {
+                  "address": "10 High Street, London, EC1A 1BB",
+                  "referenceData": "NEW-REF-XYZ",
+                  "contactDetails": { "email": "jane.doe@example.com" }
+                }
+              },
+              "billingProfile": null, "pricingProfile": null, "riskProfile": null
+            },
+            "metadata": null
+          }
+        }""";
+
+    @Test
+    void indicatorBill_writesReferenceDataToBillingRateCode() throws Exception {
+        JsonNode r = merge(P1_BILL, P2);
+        assertThat(r.at("/customer/account/billingProfile/rateCode").asText()).isEqualTo("NEW-REF-XYZ");
+        assertThat(r.at("/customer/account/billingProfile/paymentMethod").asText()).isEqualTo("DIRECT_DEBIT");
+        assertThat(r.at("/customer/account/pricingProfile/priceCode").asText()).isEqualTo("TIER-A");
+        assertThat(r.at("/customer/account/riskProfile/riskIndicator").asText()).isEqualTo("LOW");
+    }
+
+    @Test
+    void indicatorPrice_writesReferenceDataToPricingPriceCode() throws Exception {
+        JsonNode r = merge(P1_BILL.replace("\"BILL\"", "\"PRICE\""), P2);
+        assertThat(r.at("/customer/account/pricingProfile/priceCode").asText()).isEqualTo("NEW-REF-XYZ");
+        assertThat(r.at("/customer/account/billingProfile/rateCode").asText()).isEqualTo("STALE-RATE");
+    }
+
+    @Test
+    void indicatorRisk_writesReferenceDataToRiskIndicator() throws Exception {
+        JsonNode r = merge(P1_BILL.replace("\"BILL\"", "\"RISK\""), P2);
+        assertThat(r.at("/customer/account/riskProfile/riskIndicator").asText()).isEqualTo("NEW-REF-XYZ");
+        assertThat(r.at("/customer/account/billingProfile/rateCode").asText()).isEqualTo("STALE-RATE");
+    }
+
+    @Test
+    void hvp_flatFieldsMergedCorrectly() throws Exception {
+        JsonNode hvp = merge(P1_BILL, P2).at("/customer/account/profile/HVP");
+        assertThat(hvp.path("name").asText()).isEqualTo("Jane Doe");
+        assertThat(hvp.path("address").asText()).isEqualTo("10 High Street, London, EC1A 1BB");
+        assertThat(hvp.path("referenceData").asText()).isEqualTo("NEW-REF-XYZ");
+    }
+
+    @Test
+    void hvp_contactDetailsDeepMerged() throws Exception {
+        JsonNode cd = merge(P1_BILL, P2).at("/customer/account/profile/HVP/contactDetails");
+        assertThat(cd.path("phone").asText()).isEqualTo("555-1234");
+        assertThat(cd.path("preferredContact").asText()).isEqualTo("PHONE");
+        assertThat(cd.path("email").asText()).isEqualTo("jane.doe@example.com");
+    }
+
+    @Test
+    void p2NullsOutsideHvp_neverOverwriteP1() throws Exception {
+        JsonNode r = merge(P1_BILL, P2);
+        assertThat(r.at("/customer/customerId").asText()).isEqualTo("CUST-0042");
+        assertThat(r.at("/customer/account/routingConfig/configVersion").asText()).isEqualTo("v2");
+        assertThat(r.at("/customer/account/profile/tier").asText()).isEqualTo("GOLD");
+        assertThat(r.at("/customer/metadata/flags").get(0).asText()).isEqualTo("VERIFIED");
+    }
+
+    private JsonNode merge(String p1, String p2) throws Exception {
+        MergeRequest req = new MergeRequest();
+        req.setMergeId("customer-hvp-merge");
+        req.setPayload1(objectMapper.readTree(p1));
+        req.setPayload2(objectMapper.readTree(p2));
+        return mergeService.merge(req).getResult();
+    }
+}
+
+
+
+<project xmlns="http://maven.apache.org/POM/4.0.0" ...>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.0</version>
+  </parent>
+
+  <groupId>com.example</groupId>
+  <artifactId>hvp-merger</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+
+  <properties>
+    <java.version>17</java.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+
+    <!-- JSONata expression engine -->
+    <dependency>
+      <groupId>com.dashjoin</groupId>
+      <artifactId>jsonata-java</artifactId>
+      <version>0.3.3</version>
+    </dependency>
+
+    <!-- Lombok -->
+    <dependency>
+      <groupId>org.projectlombok</groupId>
+      <artifactId>lombok</artifactId>
+      <optional>true</optional>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-test</artifactId>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+        <includes>
+          <include>**/*.json</include>
+          <include>**/*.jsonata</include>  <!-- IMPORTANT: include .jsonata on classpath -->
+          <include>**/*.yml</include>
+        </includes>
+      </resource>
+    </resources>
+  </build>
+</project>
