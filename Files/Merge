@@ -1,0 +1,280 @@
+package com.yourpkg.transform.util;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Component;
+
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.HashSet;
+
+/**
+ * Processor to merge two JSON nodes with configurable conflict resolution.
+ * Supports deep merge of nested objects and arrays.
+ */
+@Slf4j
+@Component
+public class JsonMergeProcessor {
+
+    private final ObjectMapper objectMapper;
+    private final JsonMergeConfig mergeConfig;
+
+    public JsonMergeProcessor(ObjectMapper objectMapper, JsonMergeConfig mergeConfig) {
+        this.objectMapper = objectMapper;
+        this.mergeConfig = mergeConfig;
+    }
+
+    /**
+     * CHANGE:
+     * Preferred API. Directly merge two JsonNodes instead of forcing caller
+     * to wrap them into {"left":..., "right":...}.
+     *
+     * @param left  left JsonNode
+     * @param right right JsonNode
+     * @return merged JsonNode
+     */
+    public JsonNode merge(JsonNode left, JsonNode right) {
+        JsonNode normalizedLeft = normalizeNullNode(left);   // CHANGE
+        JsonNode normalizedRight = normalizeNullNode(right); // CHANGE
+
+        if (normalizedLeft == null && normalizedRight == null) {
+            throw new IllegalArgumentException("At least one input JSON node must be non-null");
+        }
+
+        if (normalizedLeft == null) {
+            log.trace("Left is null, returning deep copy of right");
+            return normalizedRight.deepCopy(); // CHANGE: return copy for safety
+        }
+
+        if (normalizedRight == null) {
+            log.trace("Right is null, returning deep copy of left");
+            return normalizedLeft.deepCopy(); // CHANGE: return copy for safety
+        }
+
+        log.trace("Merging two JsonNodes with default preference [{}] and array strategy [{}]",
+                mergeConfig.getDefaultPreference(),
+                mergeConfig.getArrayMergeStrategy());
+
+        return deepMerge(normalizedLeft, normalizedRight, "$"); // CHANGE: added path tracking
+    }
+
+    /**
+     * CHANGE:
+     * Backward-compatible wrapper for old contract:
+     * {
+     *   "left": {...},
+     *   "right": {...}
+     * }
+     *
+     * This lets you keep existing callers if needed.
+     *
+     * @param input object containing "left" and/or "right"
+     * @return merged JsonNode
+     */
+    public JsonNode merge(JsonNode input) {
+        if (input == null || !input.isObject()) {
+            throw new IllegalArgumentException("Input must be a JSON object");
+        }
+
+        JsonNode left = input.get("left");
+        JsonNode right = input.get("right");
+
+        if ((left == null || left.isNull()) && (right == null || right.isNull())) {
+            throw new IllegalArgumentException("Input must contain at least one of 'left' or 'right'");
+        }
+
+        return merge(left, right); // CHANGE: delegate to new API
+    }
+
+    /**
+     * CHANGE:
+     * Future-proof helper for your later use case where more than 2 nodes
+     * may need merging (for example full payload + tag + override section).
+     *
+     * @param nodes list of JsonNodes to merge in order
+     * @return merged JsonNode
+     */
+    public JsonNode mergeAll(List<JsonNode> nodes) {
+        if (nodes == null || nodes.isEmpty()) {
+            throw new IllegalArgumentException("Node list must not be null or empty");
+        }
+
+        JsonNode result = null;
+        for (JsonNode node : nodes) {
+            JsonNode normalized = normalizeNullNode(node);
+            if (normalized == null) {
+                continue;
+            }
+
+            result = (result == null) ? normalized.deepCopy() : merge(result, normalized);
+        }
+
+        if (result == null) {
+            throw new IllegalArgumentException("All nodes in list were null");
+        }
+
+        return result;
+    }
+
+    /**
+     * Deep merges two JSON nodes recursively.
+     *
+     * @param left  left node
+     * @param right right node
+     * @param path  current JSON path for future path-based rules / better logging
+     * @return merged node
+     */
+    private JsonNode deepMerge(JsonNode left, JsonNode right, String path) {
+        JsonNode normalizedLeft = normalizeNullNode(left);   // CHANGE
+        JsonNode normalizedRight = normalizeNullNode(right); // CHANGE
+
+        if (normalizedLeft == null) {
+            return normalizedRight == null ? null : normalizedRight.deepCopy();
+        }
+
+        if (normalizedRight == null) {
+            return normalizedLeft.deepCopy();
+        }
+
+        if (normalizedLeft.isObject() && normalizedRight.isObject()) {
+            return mergeObjects((ObjectNode) normalizedLeft.deepCopy(), normalizedRight, path);
+        }
+
+        if (normalizedLeft.isArray() && normalizedRight.isArray()) {
+            return mergeArrays((ArrayNode) normalizedLeft, (ArrayNode) normalizedRight, path);
+        }
+
+        return resolveConflict(normalizedLeft, normalizedRight, path);
+    }
+
+    /**
+     * Merges two object nodes recursively.
+     */
+    private ObjectNode mergeObjects(ObjectNode leftCopy, JsonNode right, String path) {
+        Iterator<Map.Entry<String, JsonNode>> rightFields = right.fields();
+
+        while (rightFields.hasNext()) {
+            Map.Entry<String, JsonNode> rightField = rightFields.next();
+            String fieldName = rightField.getKey();
+            JsonNode rightValue = rightField.getValue();
+            JsonNode leftValue = leftCopy.get(fieldName);
+
+            String currentPath = buildPath(path, fieldName); // CHANGE
+
+            if (leftValue == null || leftValue.isNull()) {
+                leftCopy.set(fieldName, rightValue == null ? null : rightValue.deepCopy());
+            } else {
+                JsonNode merged = deepMerge(leftValue, rightValue, currentPath);
+                leftCopy.set(fieldName, merged);
+            }
+        }
+
+        return leftCopy;
+    }
+
+    /**
+     * Merges two array nodes based on configuration.
+     */
+    private ArrayNode mergeArrays(ArrayNode left, ArrayNode right, String path) {
+        return switch (mergeConfig.getArrayMergeStrategy()) {
+            case CONCATENATE -> concatenateArrays(left, right);
+            case DEDUPLICATE -> deduplicateArrays(left, right);
+            case PREFER_LEFT -> copyArray(left);   // CHANGE: return copy, not original
+            case PREFER_RIGHT -> copyArray(right); // CHANGE: return copy, not original
+        };
+    }
+
+    /**
+     * Concatenates two arrays.
+     */
+    private ArrayNode concatenateArrays(ArrayNode left, ArrayNode right) {
+        ArrayNode result = objectMapper.createArrayNode();
+
+        left.forEach(node -> result.add(node.deepCopy()));   // CHANGE: deep copy
+        right.forEach(node -> result.add(node.deepCopy()));  // CHANGE: deep copy
+
+        return result;
+    }
+
+    /**
+     * CHANGE:
+     * Deduplicates using JsonNode equality instead of node.toString().
+     * This is safer and more semantically correct than String-based dedupe.
+     */
+    private ArrayNode deduplicateArrays(ArrayNode left, ArrayNode right) {
+        ArrayNode result = objectMapper.createArrayNode();
+        Set<JsonNode> seen = new HashSet<>();
+
+        for (JsonNode node : left) {
+            JsonNode copy = node.deepCopy();
+            if (seen.add(copy)) {
+                result.add(copy);
+            }
+        }
+
+        for (JsonNode node : right) {
+            JsonNode copy = node.deepCopy();
+            if (seen.add(copy)) {
+                result.add(copy);
+            }
+        }
+
+        return result;
+    }
+
+    /**
+     * Resolves conflict between two primitive or differing-type nodes.
+     */
+    private JsonNode resolveConflict(JsonNode left, JsonNode right, String path) {
+        if (Objects.equals(left, right)) {
+            return left.deepCopy(); // CHANGE
+        }
+
+        // CHANGE:
+        // path is passed in even if today you only use default preference.
+        // Later you can enhance JsonMergeConfig to support path-level rules.
+        boolean preferLeft = mergeConfig.getDefaultPreference() == JsonMergeConfig.MergePreference.LEFT;
+
+        JsonNode chosen = preferLeft ? left : right;
+
+        log.trace("Conflict at path [{}]. Left: [{}], Right: [{}], Choosing [{}] based on default preference [{}]",
+                path, left, right, chosen, mergeConfig.getDefaultPreference());
+
+        return chosen.deepCopy(); // CHANGE
+    }
+
+    /**
+     * CHANGE:
+     * Normalize Jackson null-node to Java null for consistent handling.
+     */
+    private JsonNode normalizeNullNode(JsonNode node) {
+        return (node == null || node.isNull()) ? null : node;
+    }
+
+    /**
+     * CHANGE:
+     * Helper to build JSON-style paths for logging / future field-level rules.
+     */
+    private String buildPath(String basePath, String fieldName) {
+        if (basePath == null || basePath.isBlank() || "$".equals(basePath)) {
+            return "$." + fieldName;
+        }
+        return basePath + "." + fieldName;
+    }
+
+    /**
+     * CHANGE:
+     * Copy array defensively.
+     */
+    private ArrayNode copyArray(ArrayNode source) {
+        ArrayNode copy = objectMapper.createArrayNode();
+        source.forEach(node -> copy.add(node.deepCopy()));
+        return copy;
+    }
+}
