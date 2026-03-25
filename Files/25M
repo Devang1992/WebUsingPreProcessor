@@ -1,0 +1,543 @@
+Final recommended full class
+
+Here is the final class with the true optimized path replacement already included.
+
+package com.td.pwssp.util;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.NullNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import lombok.experimental.UtilityClass;
+
+import java.util.Iterator;
+import java.util.Map;
+
+@UtilityClass
+public class JsonMergeUtil {
+
+    public enum MergePreference {
+        PREFER_LEFT,
+        PREFER_RIGHT
+    }
+
+    public static JsonNode merge(JsonNode left, JsonNode right) {
+        return merge(left, right, MergePreference.PREFER_RIGHT);
+    }
+
+    public static JsonNode merge(JsonNode left, JsonNode right, MergePreference preference) {
+        if (left == null || left.isNull()) {
+            return copyOrNull(right);
+        }
+
+        if (right == null || right.isNull()) {
+            return copyOrNull(left);
+        }
+
+        if (left.isObject() && right.isObject()) {
+            return mergeObjects((ObjectNode) left, (ObjectNode) right, preference);
+        }
+
+        return preference == MergePreference.PREFER_LEFT
+                ? left.deepCopy()
+                : right.deepCopy();
+    }
+
+    public static JsonNode mergeAtPath(JsonNode left,
+                                       JsonNode right,
+                                       String mergePath,
+                                       MergePreference preference) {
+
+        validatePath(mergePath);
+
+        if (left == null || left.isNull()) {
+            return copyOrNull(right);
+        }
+
+        if (right == null || right.isNull()) {
+            return copyOrNull(left);
+        }
+
+        if (!left.isObject()) {
+            throw new IllegalArgumentException("Left root must be a JSON object");
+        }
+
+        if (!right.isObject()) {
+            throw new IllegalArgumentException("Right root must be a JSON object");
+        }
+
+        JsonNode leftSection = left.at(mergePath);
+        JsonNode rightSection = right.at(mergePath);
+
+        if (leftSection.isMissingNode() && rightSection.isMissingNode()) {
+            return left.deepCopy();
+        }
+
+        JsonNode mergedSection;
+        if (leftSection.isMissingNode()) {
+            mergedSection = copyOrNull(rightSection);
+        } else if (rightSection.isMissingNode()) {
+            mergedSection = leftSection.deepCopy();
+        } else {
+            mergedSection = merge(leftSection, rightSection, preference);
+        }
+
+        return copyRootWithPathReplaced((ObjectNode) left, mergePath, mergedSection);
+    }
+
+    private static ObjectNode mergeObjects(ObjectNode left, ObjectNode right, MergePreference preference) {
+        ObjectNode result = left.deepCopy();
+
+        Iterator<Map.Entry<String, JsonNode>> rightFields = right.fields();
+        while (rightFields.hasNext()) {
+            Map.Entry<String, JsonNode> entry = rightFields.next();
+            String fieldName = entry.getKey();
+            JsonNode rightValue = entry.getValue();
+            JsonNode leftValue = result.get(fieldName);
+
+            if (leftValue == null) {
+                result.set(fieldName, copyOrNull(rightValue));
+            } else if (leftValue.isObject() && rightValue != null && rightValue.isObject()) {
+                result.set(fieldName, merge(leftValue, rightValue, preference));
+            } else if (preference == MergePreference.PREFER_RIGHT) {
+                result.set(fieldName, copyOrNull(rightValue));
+            }
+        }
+
+        return result;
+    }
+
+    private static ObjectNode copyRootWithPathReplaced(ObjectNode leftRoot,
+                                                       String path,
+                                                       JsonNode replacementValue) {
+        String[] segments = parsePathSegments(path);
+        return copyObjectNodeAlongPath(leftRoot, segments, 0, replacementValue);
+    }
+
+    private static ObjectNode copyObjectNodeAlongPath(ObjectNode originalNode,
+                                                      String[] segments,
+                                                      int index,
+                                                      JsonNode replacementValue) {
+
+        ObjectNode copiedNode = JsonNodeFactory.instance.objectNode();
+
+        Iterator<Map.Entry<String, JsonNode>> fields = originalNode.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> entry = fields.next();
+            copiedNode.set(entry.getKey(), entry.getValue());
+        }
+
+        String currentSegment = segments[index];
+
+        if (index == segments.length - 1) {
+            copiedNode.set(currentSegment, copyOrNull(replacementValue));
+            return copiedNode;
+        }
+
+        JsonNode child = originalNode.get(currentSegment);
+        ObjectNode childObject;
+
+        if (child == null || child.isMissingNode() || child.isNull()) {
+            childObject = JsonNodeFactory.instance.objectNode();
+        } else if (child.isObject()) {
+            childObject = (ObjectNode) child;
+        } else {
+            throw new IllegalArgumentException(
+                    "Path segment '" + currentSegment + "' is not an object in left payload"
+            );
+        }
+
+        ObjectNode copiedChild = copyObjectNodeAlongPath(childObject, segments, index + 1, replacementValue);
+        copiedNode.set(currentSegment, copiedChild);
+
+        return copiedNode;
+    }
+
+    private static JsonNode copyOrNull(JsonNode node) {
+        if (node == null || node.isNull()) {
+            return NullNode.getInstance();
+        }
+        return node.deepCopy();
+    }
+
+    private static void validatePath(String path) {
+        if (path == null || path.isBlank()) {
+            throw new IllegalArgumentException("mergePath must not be null or blank");
+        }
+        if (!path.startsWith("/")) {
+            throw new IllegalArgumentException("mergePath must start with '/' (JSON Pointer format)");
+        }
+        if ("/".equals(path)) {
+            throw new IllegalArgumentException("Root path '/' is not supported for mergeAtPath");
+        }
+    }
+
+    private static String[] parsePathSegments(String path) {
+        validatePath(path);
+
+        String[] rawSegments = path.substring(1).split("/");
+        for (String segment : rawSegments) {
+            if (segment.isBlank()) {
+                throw new IllegalArgumentException("Invalid mergePath: empty path segment in '" + path + "'");
+            }
+        }
+        return rawSegments;
+    }
+}
+Test class
+
+Here is a JUnit 5 test class for it.
+
+package com.td.pwssp.util;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
+
+import static com.td.pwssp.util.JsonMergeUtil.MergePreference.PREFER_LEFT;
+import static com.td.pwssp.util.JsonMergeUtil.MergePreference.PREFER_RIGHT;
+import static org.junit.jupiter.api.Assertions.*;
+
+class JsonMergeUtilTest {
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Test
+    void shouldDeepMergeObjectsPreferringRight() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                {
+                  "a": 1,
+                  "b": {
+                    "x": 10,
+                    "y": 20
+                  }
+                }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                {
+                  "b": {
+                    "y": 999,
+                    "z": 30
+                  },
+                  "c": 3
+                }
+                """);
+
+        JsonNode result = JsonMergeUtil.merge(left, right, PREFER_RIGHT);
+
+        assertEquals(1, result.get("a").asInt());
+        assertEquals(10, result.get("b").get("x").asInt());
+        assertEquals(999, result.get("b").get("y").asInt());
+        assertEquals(30, result.get("b").get("z").asInt());
+        assertEquals(3, result.get("c").asInt());
+    }
+
+    @Test
+    void shouldDeepMergeObjectsPreferringLeft() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                {
+                  "b": {
+                    "y": 20
+                  }
+                }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                {
+                  "b": {
+                    "y": 999,
+                    "z": 30
+                  }
+                }
+                """);
+
+        JsonNode result = JsonMergeUtil.merge(left, right, PREFER_LEFT);
+
+        assertEquals(20, result.get("b").get("y").asInt());
+        assertEquals(30, result.get("b").get("z").asInt());
+    }
+
+    @Test
+    void shouldPreferRightForPrimitiveConflict() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                { "field": "left-value" }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                { "field": "right-value" }
+                """);
+
+        JsonNode result = JsonMergeUtil.merge(left, right, PREFER_RIGHT);
+
+        assertEquals("right-value", result.get("field").asText());
+    }
+
+    @Test
+    void shouldPreferLeftForPrimitiveConflict() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                { "field": "left-value" }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                { "field": "right-value" }
+                """);
+
+        JsonNode result = JsonMergeUtil.merge(left, right, PREFER_LEFT);
+
+        assertEquals("left-value", result.get("field").asText());
+    }
+
+    @Test
+    void shouldChooseWholeArrayByPreference() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                { "items": [1, 2] }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                { "items": [9, 8] }
+                """);
+
+        JsonNode resultRight = JsonMergeUtil.merge(left, right, PREFER_RIGHT);
+        JsonNode resultLeft = JsonMergeUtil.merge(left, right, PREFER_LEFT);
+
+        assertEquals(9, resultRight.get("items").get(0).asInt());
+        assertEquals(8, resultRight.get("items").get(1).asInt());
+
+        assertEquals(1, resultLeft.get("items").get(0).asInt());
+        assertEquals(2, resultLeft.get("items").get(1).asInt());
+    }
+
+    @Test
+    void shouldMergeOnlyAtPath() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                {
+                  "header": {
+                    "id": "123"
+                  },
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "field1": "left1",
+                        "field2": "left2"
+                      }
+                    }
+                  },
+                  "footer": {
+                    "status": "old"
+                  }
+                }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                {
+                  "header": {
+                    "id": "999"
+                  },
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "field2": "right2",
+                        "field3": "right3"
+                      }
+                    }
+                  },
+                  "footer": {
+                    "status": "new"
+                  }
+                }
+                """);
+
+        JsonNode result = JsonMergeUtil.mergeAtPath(
+                left,
+                right,
+                "/TDDMessage/TDDMExtended/HVP",
+                PREFER_RIGHT
+        );
+
+        assertEquals("123", result.at("/header/id").asText());
+        assertEquals("old", result.at("/footer/status").asText());
+
+        assertEquals("left1", result.at("/TDDMessage/TDDMExtended/HVP/field1").asText());
+        assertEquals("right2", result.at("/TDDMessage/TDDMExtended/HVP/field2").asText());
+        assertEquals("right3", result.at("/TDDMessage/TDDMExtended/HVP/field3").asText());
+    }
+
+    @Test
+    void shouldAddPathFromRightIfMissingInLeft() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {}
+                  }
+                }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "field1": "value1"
+                      }
+                    }
+                  }
+                }
+                """);
+
+        JsonNode result = JsonMergeUtil.mergeAtPath(
+                left,
+                right,
+                "/TDDMessage/TDDMExtended/HVP",
+                PREFER_RIGHT
+        );
+
+        assertEquals("value1", result.at("/TDDMessage/TDDMExtended/HVP/field1").asText());
+    }
+
+    @Test
+    void shouldKeepLeftPathIfMissingInRight() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "field1": "left-only"
+                      }
+                    }
+                  }
+                }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {}
+                  }
+                }
+                """);
+
+        JsonNode result = JsonMergeUtil.mergeAtPath(
+                left,
+                right,
+                "/TDDMessage/TDDMExtended/HVP",
+                PREFER_RIGHT
+        );
+
+        assertEquals("left-only", result.at("/TDDMessage/TDDMExtended/HVP/field1").asText());
+    }
+
+    @Test
+    void shouldReturnCopyOfLeftWhenPathMissingInBoth() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                { "a": 1 }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                { "b": 2 }
+                """);
+
+        JsonNode result = JsonMergeUtil.mergeAtPath(left, right, "/missing/path", PREFER_RIGHT);
+
+        assertEquals(1, result.get("a").asInt());
+        assertTrue(result.get("b") == null);
+        assertNotSame(left, result);
+    }
+
+    @Test
+    void shouldNotMutateOriginalInputs() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "field1": "left1"
+                      }
+                    }
+                  }
+                }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "field1": "right1",
+                        "field2": "right2"
+                      }
+                    }
+                  }
+                }
+                """);
+
+        JsonNode result = JsonMergeUtil.mergeAtPath(
+                left,
+                right,
+                "/TDDMessage/TDDMExtended/HVP",
+                PREFER_RIGHT
+        );
+
+        assertEquals("left1", left.at("/TDDMessage/TDDMExtended/HVP/field1").asText());
+        assertTrue(left.at("/TDDMessage/TDDMExtended/HVP/field2").isMissingNode());
+
+        assertEquals("right1", result.at("/TDDMessage/TDDMExtended/HVP/field1").asText());
+        assertEquals("right2", result.at("/TDDMessage/TDDMExtended/HVP/field2").asText());
+    }
+
+    @Test
+    void shouldThrowForInvalidPathWithoutSlash() throws Exception {
+        JsonNode left = objectMapper.readTree("{\"a\":1}");
+        JsonNode right = objectMapper.readTree("{\"a\":2}");
+
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                () -> JsonMergeUtil.mergeAtPath(left, right, "a/b", PREFER_RIGHT)
+        );
+
+        assertTrue(ex.getMessage().contains("must start with '/'"));
+    }
+
+    @Test
+    void shouldThrowForRootPath() throws Exception {
+        JsonNode left = objectMapper.readTree("{\"a\":1}");
+        JsonNode right = objectMapper.readTree("{\"a\":2}");
+
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                () -> JsonMergeUtil.mergeAtPath(left, right, "/", PREFER_RIGHT)
+        );
+
+        assertTrue(ex.getMessage().contains("Root path '/' is not supported"));
+    }
+
+    @Test
+    void shouldThrowWhenIntermediatePathIsNotObject() throws Exception {
+        JsonNode left = objectMapper.readTree("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": "not-an-object"
+                  }
+                }
+                """);
+
+        JsonNode right = objectMapper.readTree("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "field1": "value"
+                      }
+                    }
+                  }
+                }
+                """);
+
+        IllegalArgumentException ex = assertThrows(
+                IllegalArgumentException.class,
+                () -> JsonMergeUtil.mergeAtPath(left, right, "/TDDMessage/TDDMExtended/HVP", PREFER_RIGHT)
+        );
+
+        assertTrue(ex.getMessage().contains("is not an object"));
+    }
+}
