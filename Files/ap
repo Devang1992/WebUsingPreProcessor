@@ -1,0 +1,292 @@
+Best structure
+
+Do it in 2 layers:
+
+1. pants-mapper.xq
+
+Keep this as the main module only
+
+parses JSON
+detects message type
+dispatches to pacs004 / 008 / 009
+2. Create a new shared library module
+
+Something like:
+
+pants-common.xq
+
+This should contain:
+
+normalizeOrNull
+safe-array-item
+common field builders
+maybe reusable sub-map builders like customer/posting/creditor if same across files
+
+This is better than putting helper functions inside pants-mapper.xq, because imported library modules usually cannot import from the main module. Main module is entrypoint, not shared utility.
+
+So:
+
+pants-mapper.xq = dispatcher
+pants-common.xq = shared reusable code
+tddm-pacs004-pdm-public.xq = pacs004 specific mapping
+tddm-pacs008-pdm-public.xq = pacs008 specific mapping
+tddm-pacs009-pdm-public.xq = pacs009 specific mapping
+Why not keep common functions in pants-mapper.xq?
+
+Because your pacs files are imported by pants-mapper.xq.
+
+They generally should not depend back on the main module. That creates the wrong direction of dependency.
+
+Think of it like Java:
+
+pants-mapper.xq = Main.java
+pants-common.xq = CommonUtils.java
+tddm-pacs004...xq = Pacs004Mapper.java
+
+You would not put utility methods inside Main.java and expect all mapper classes to import from it.
+
+Recommended design
+File 1: pants-common.xq
+xquery version "3.1";
+
+module namespace common = "http://www.td.com/pants-common";
+
+declare function common:normalizeOrNull($value as item()*) as item()? {
+  if (exists($value) and normalize-space(string($value)) != "") then
+    normalize-space(string($value))
+  else
+    ()
+};
+
+declare function common:safe-array-item($arr as item()*, $idx as xs:integer) as item()? {
+  if (empty($arr)) then
+    ()
+  else if ($arr instance of array(*)) then
+    if ($idx ge 1 and $idx le array:size($arr)) then
+      $arr?($idx)
+    else
+      ()
+  else if ($idx = 1) then
+    $arr
+  else
+    ()
+};
+
+declare function common:customer($hvp as item()*) as map(*) {
+  map {
+    "name": common:normalizeOrNull($hvp?Customer?Name),
+    "address1": common:normalizeOrNull($hvp?Customer?Address1),
+    "address2": common:normalizeOrNull($hvp?Customer?Address2),
+    "address3": common:normalizeOrNull($hvp?Customer?Address3),
+    "city": common:normalizeOrNull($hvp?Customer?City),
+    "state": common:normalizeOrNull($hvp?Customer?State),
+    "zip": common:normalizeOrNull($hvp?Customer?Zip)
+  }
+};
+
+declare function common:posting($hvp as item()*) as map(*) {
+  map {
+    "accountNumber": common:normalizeOrNull($hvp?DebitAccount?AccNb),
+    "creditAccountNumber": common:normalizeOrNull($hvp?CreditAccount?AccNb),
+    "debitFees": common:normalizeOrNull($hvp?Fee?DbFee),
+    "creditFees": common:normalizeOrNull($hvp?Fee?CrFee)
+  }
+};
+
+declare function common:baseFields($jsonInput as map(*), $type as xs:string) as map(*) {
+  let $hvp := $jsonInput?TDDMessage?TDDMExtended?HVP
+  return map {
+    "type": $type,
+    "direction": common:normalizeOrNull($hvp?Direction),
+    "mid": common:normalizeOrNull($hvp?Id?MID),
+    "status": common:normalizeOrNull($hvp?Status),
+    "adviceCode": common:normalizeOrNull($hvp?AdviceCode),
+    "prodCode": common:normalizeOrNull($hvp?ProdCode),
+    "customer": common:customer($hvp),
+    "posting": common:posting($hvp),
+    "createDate": common:normalizeOrNull($hvp?CreateDate)
+  }
+};
+File 2: tddm-pacs004-pdm-public.xq
+xquery version "3.1";
+
+module namespace tddm4 = "http://www.td.com/tddm-pacs004";
+
+import module namespace common = "http://www.td.com/pants-common" at "pants-common.xq";
+
+declare function tddm4:mapPacs004($jsonInput as map(*)) as map(*) {
+  let $base := common:baseFields($jsonInput, "pacs.004")
+  return map:merge((
+    $base,
+    map {
+      "creditor": map {
+        "name": common:normalizeOrNull($jsonInput?TDDMessage?TDDMessageBody?PmtRtr?TxInf?RtrChain?Dbtr?Nm)
+      }
+    }
+  ))
+};
+File 3: tddm-pacs008-pdm-public.xq
+xquery version "3.1";
+
+module namespace tddm8 = "http://www.td.com/tddm-pacs008";
+
+import module namespace common = "http://www.td.com/pants-common" at "pants-common.xq";
+
+declare function tddm8:mapPacs008($jsonInput as map(*)) as map(*) {
+  let $base := common:baseFields($jsonInput, "pacs.008")
+  return map:merge((
+    $base,
+    map {
+      "somePacs008SpecificField": common:normalizeOrNull(
+        $jsonInput?TDDMessage?TDDMessageBody?FIToFICstmrCdtTrf?GrpHdr?MsgId
+      )
+    }
+  ))
+};
+File 4: tddm-pacs009-pdm-public.xq
+xquery version "3.1";
+
+module namespace tddm9 = "http://www.td.com/tddm-pacs009";
+
+import module namespace common = "http://www.td.com/pants-common" at "pants-common.xq";
+
+declare function tddm9:mapPacs009($jsonInput as map(*)) as map(*) {
+  let $base := common:baseFields($jsonInput, "pacs.009")
+  return map:merge((
+    $base,
+    map {
+      "creditor": map {
+        "name": common:normalizeOrNull($jsonInput?TDDMessage?TDDMessageBody?FICdtTrf?CdtTrfTxInf?Cdtr?Nm),
+        "address1": common:normalizeOrNull(
+          common:safe-array-item(
+            $jsonInput?TDDMessage?TDDMessageBody?FICdtTrf?CdtTrfTxInf?Cdtr?FinInstnId?PstlAdr?AdrLine,
+            1
+          )
+        ),
+        "address2": common:normalizeOrNull(
+          common:safe-array-item(
+            $jsonInput?TDDMessage?TDDMessageBody?FICdtTrf?CdtTrfTxInf?Cdtr?FinInstnId?PstlAdr?AdrLine,
+            2
+          )
+        ),
+        "address3": common:normalizeOrNull(
+          common:safe-array-item(
+            $jsonInput?TDDMessage?TDDMessageBody?FICdtTrf?CdtTrfTxInf?Cdtr?FinInstnId?PstlAdr?AdrLine,
+            3
+          )
+        )
+      }
+    }
+  ))
+};
+File 5: pants-mapper.xq
+
+This stays clean and small:
+
+xquery version "3.1";
+
+import module namespace tddm4 = "http://www.td.com/tddm-pacs004" at "tddm-pacs004-pdm-public.xq";
+import module namespace tddm8 = "http://www.td.com/tddm-pacs008" at "tddm-pacs008-pdm-public.xq";
+import module namespace tddm9 = "http://www.td.com/tddm-pacs009" at "tddm-pacs009-pdm-public.xq";
+
+declare namespace output = "http://www.w3.org/2010/xslt-xquery-serialization";
+declare option output:method "json";
+declare option output:indent "yes";
+
+declare variable $pdmPublic external;
+
+let $jsonInput := parse-json($pdmPublic)
+let $messageType := string($jsonInput?TDDMessage?TDDMessageBody?("x-type"))
+
+return
+  if ($messageType = "pacs.004") then
+    tddm4:mapPacs004($jsonInput)
+  else if ($messageType = "pacs.008") then
+    tddm8:mapPacs008($jsonInput)
+  else if ($messageType = "pacs.009") then
+    tddm9:mapPacs009($jsonInput)
+  else
+    error(
+      QName("http://www.td.com/errors", "UNKNOWN_MESSAGE_TYPE"),
+      "Unknown message type: " || (($messageType, "<missing>")[1]),
+      map { "received": (($messageType, "<missing>")[1]) }
+    )
+For your exact requirement of 20 common fields
+
+You have 2 options.
+
+Option A — common helper returns a base map
+
+Best when those fields are identical across all pacs.
+
+Example:
+
+let $base := common:baseFields($jsonInput, "pacs.004")
+return map:merge(($base, map { ...specific fields... }))
+
+This is what I recommend.
+
+Option B — common helper per section
+
+Example:
+
+common:customer($hvp)
+common:posting($hvp)
+common:agent(...)
+common:id(...)
+
+Best when some sections are reused but not always all 20 fields.
+
+In practice, a mix of A and B is best.
+
+One important improvement to your current helper
+
+Your current safe-array-item is using 0-based style:
+
+if ($idx ge 0 and $idx lt array:size($arr))
+
+That is not ideal for the way you are calling fields semantically as 1, 2, 3.
+
+Use 1-based indexing instead:
+
+declare function common:safe-array-item($arr as item()*, $idx as xs:integer) as item()? {
+  if (empty($arr)) then
+    ()
+  else if ($arr instance of array(*)) then
+    if ($idx ge 1 and $idx le array:size($arr)) then
+      $arr?($idx)
+    else
+      ()
+  else if ($idx = 1) then
+    $arr
+  else
+    ()
+};
+
+This matches:
+
+address1 -> index 1
+address2 -> index 2
+address3 -> index 3
+
+Much cleaner.
+
+My recommendation
+
+Do this:
+
+Create pants-common.xq
+Move:
+normalizeOrNull
+safe-array-item
+all common field builders
+into it
+Keep pants-mapper.xq only as dispatcher
+In each pacs file:
+import pants-common.xq
+build let $base := common:baseFields(...)
+merge in pac-specific fields
+
+That is the cleanest and most senior design.
+
+If you want, next I can write the full pants-common.xq for your exact fields from the screenshots, plus show how pacs004/008/009 should call it.
