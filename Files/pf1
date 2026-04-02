@@ -1,0 +1,421 @@
+import re
+import sys
+import json
+import csv
+from pathlib import Path
+from collections import Counter
+
+try:
+    from pypdf import PdfReader
+except ImportError:
+    PdfReader = None
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+# Match ONLY when "Reference number" starts at the beginning of a line
+# This avoids matching "UETR Reference number"
+#
+# Examples matched:
+# Reference number 12345
+# Reference number: 12345
+# Reference number
+# 12345
+# Reference    number     ABC123
+#
+# Examples NOT matched:
+# UETR Reference number 12345
+# Some text Reference number 12345
+REFERENCE_PATTERN = re.compile(
+    r"(?im)^[ \t]*Reference\s*number[\s:]*([A-Za-z0-9\-_\/]+)"
+)
+
+MAX_REFERENCE_LENGTH = 16
+
+
+# ============================================================
+# FILE READING
+# ============================================================
+
+def read_text_file(file_path: Path) -> str:
+    return file_path.read_text(encoding="utf-8", errors="ignore")
+
+
+def read_pdf_file(file_path: Path) -> str:
+    if PdfReader is None:
+        raise ImportError("pypdf is not installed. Install it with: pip install pypdf")
+
+    reader = PdfReader(str(file_path))
+    pages_text = []
+
+    for page in reader.pages:
+        extracted = page.extract_text()
+        if extracted:
+            pages_text.append(extracted)
+
+    return "\n".join(pages_text)
+
+
+def read_file(file_path: Path) -> str:
+    suffix = file_path.suffix.lower()
+
+    if suffix == ".txt":
+        return read_text_file(file_path)
+    elif suffix == ".pdf":
+        return read_pdf_file(file_path)
+    else:
+        return read_text_file(file_path)
+
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+def normalize_text(text: str) -> str:
+    """
+    Keep line structure because matching depends on line start.
+    Only normalize line endings and obvious spacing issues.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\u00A0", " ").replace("\t", " ")
+    text = re.sub(r"[ ]{2,}", " ", text)
+    return text
+
+
+def normalize_reference(ref: str) -> str:
+    """
+    Clean extracted reference value for consistent comparison.
+    """
+    ref = ref.strip()
+    ref = re.sub(r"\s+", "", ref)
+    return ref.upper()
+
+
+# ============================================================
+# EXTRACTION
+# ============================================================
+
+def extract_references(text: str) -> list[str]:
+    normalized_text = normalize_text(text)
+    raw_refs = REFERENCE_PATTERN.findall(normalized_text)
+    cleaned_refs = [normalize_reference(ref) for ref in raw_refs if ref.strip()]
+    return cleaned_refs
+
+
+def find_long_references(refs: list[str], max_length: int = MAX_REFERENCE_LENGTH) -> list[str]:
+    """
+    Return unique references whose length is greater than allowed max.
+    """
+    return sorted(set(ref for ref in refs if len(ref) > max_length))
+
+
+# ============================================================
+# COMPARISON
+# ============================================================
+
+def compare_references(refs1: list[str], refs2: list[str]) -> dict:
+    counter1 = Counter(refs1)
+    counter2 = Counter(refs2)
+
+    set1 = set(counter1.keys())
+    set2 = set(counter2.keys())
+
+    only_in_file1 = sorted(set1 - set2)
+    only_in_file2 = sorted(set2 - set1)
+    common_refs = sorted(set1 & set2)
+
+    total_count_file1 = len(refs1)
+    total_count_file2 = len(refs2)
+
+    unique_count_file1 = len(set1)
+    unique_count_file2 = len(set2)
+
+    missing_from_file2_count = len(only_in_file1)
+    missing_from_file1_count = len(only_in_file2)
+
+    missing_from_file2_pct = (
+        (missing_from_file2_count / unique_count_file1) * 100
+        if unique_count_file1 else 0.0
+    )
+
+    missing_from_file1_pct = (
+        (missing_from_file1_count / unique_count_file2) * 100
+        if unique_count_file2 else 0.0
+    )
+
+    long_refs_file1 = find_long_references(refs1)
+    long_refs_file2 = find_long_references(refs2)
+
+    return {
+        "rules_used": {
+            "match_only_reference_number_at_line_start": True,
+            "exclude_uetr_reference_number": True,
+            "max_expected_reference_length": MAX_REFERENCE_LENGTH
+        },
+        "file_1": {
+            "total_reference_count": total_count_file1,
+            "unique_reference_count": unique_count_file1,
+            "references_longer_than_max": {
+                "count": len(long_refs_file1),
+                "references": long_refs_file1
+            }
+        },
+        "file_2": {
+            "total_reference_count": total_count_file2,
+            "unique_reference_count": unique_count_file2,
+            "references_longer_than_max": {
+                "count": len(long_refs_file2),
+                "references": long_refs_file2
+            }
+        },
+        "common_references": {
+            "count": len(common_refs),
+            "references": common_refs
+        },
+        "present_in_file_1_not_in_file_2": {
+            "count": missing_from_file2_count,
+            "missing_percentage_of_file_1_unique_refs": round(missing_from_file2_pct, 2),
+            "references": only_in_file1
+        },
+        "present_in_file_2_not_in_file_1": {
+            "count": missing_from_file1_count,
+            "missing_percentage_of_file_2_unique_refs": round(missing_from_file1_pct, 2),
+            "references": only_in_file2
+        },
+        "duplicates_summary": {
+            "file_1_duplicates": {
+                ref: count for ref, count in counter1.items() if count > 1
+            },
+            "file_2_duplicates": {
+                ref: count for ref, count in counter2.items() if count > 1
+            }
+        }
+    }
+
+
+# ============================================================
+# OUTPUT HELPERS
+# ============================================================
+
+def write_list_csv(file_path: Path, header: str, values: list[str]) -> None:
+    with file_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([header])
+        for value in values:
+            writer.writerow([value])
+
+
+def write_summary_report(report_path: Path, comparison: dict) -> None:
+    with report_path.open("w", encoding="utf-8") as f:
+        f.write("REFERENCE COMPARISON REPORT\n")
+        f.write("=" * 70 + "\n\n")
+
+        f.write("RULES USED\n")
+        f.write("-" * 70 + "\n")
+        f.write("1. Only lines starting with 'Reference number' are matched.\n")
+        f.write("2. 'UETR Reference number' is intentionally excluded.\n")
+        f.write(f"3. References longer than {MAX_REFERENCE_LENGTH} characters are flagged.\n\n")
+
+        f.write("FILE TOTALS\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"File 1 - Total refs:  {comparison['file_1']['total_reference_count']}\n")
+        f.write(f"File 1 - Unique refs: {comparison['file_1']['unique_reference_count']}\n")
+        f.write(f"File 2 - Total refs:  {comparison['file_2']['total_reference_count']}\n")
+        f.write(f"File 2 - Unique refs: {comparison['file_2']['unique_reference_count']}\n\n")
+
+        f.write("MATCHING / MISSING\n")
+        f.write("-" * 70 + "\n")
+        f.write(f"Common refs in both files: {comparison['common_references']['count']}\n")
+        f.write(
+            f"Refs in File 1 but not File 2: "
+            f"{comparison['present_in_file_1_not_in_file_2']['count']}\n"
+        )
+        f.write(
+            f"Missing % of File 1 unique refs: "
+            f"{comparison['present_in_file_1_not_in_file_2']['missing_percentage_of_file_1_unique_refs']}%\n"
+        )
+        f.write(
+            f"Refs in File 2 but not File 1: "
+            f"{comparison['present_in_file_2_not_in_file_1']['count']}\n"
+        )
+        f.write(
+            f"Missing % of File 2 unique refs: "
+            f"{comparison['present_in_file_2_not_in_file_1']['missing_percentage_of_file_2_unique_refs']}%\n\n"
+        )
+
+        f.write("LONG REFERENCES CHECK\n")
+        f.write("-" * 70 + "\n")
+        f.write(
+            f"File 1 - refs longer than {MAX_REFERENCE_LENGTH}: "
+            f"{comparison['file_1']['references_longer_than_max']['count']}\n"
+        )
+        if comparison["file_1"]["references_longer_than_max"]["references"]:
+            for ref in comparison["file_1"]["references_longer_than_max"]["references"]:
+                f.write(f"  {ref}\n")
+        else:
+            f.write("  None\n")
+
+        f.write("\n")
+        f.write(
+            f"File 2 - refs longer than {MAX_REFERENCE_LENGTH}: "
+            f"{comparison['file_2']['references_longer_than_max']['count']}\n"
+        )
+        if comparison["file_2"]["references_longer_than_max"]["references"]:
+            for ref in comparison["file_2"]["references_longer_than_max"]["references"]:
+                f.write(f"  {ref}\n")
+        else:
+            f.write("  None\n")
+
+        f.write("\nDUPLICATES\n")
+        f.write("-" * 70 + "\n")
+        f.write("File 1 duplicate refs:\n")
+        if comparison["duplicates_summary"]["file_1_duplicates"]:
+            for ref, count in sorted(comparison["duplicates_summary"]["file_1_duplicates"].items()):
+                f.write(f"  {ref}: {count}\n")
+        else:
+            f.write("  None\n")
+
+        f.write("\nFile 2 duplicate refs:\n")
+        if comparison["duplicates_summary"]["file_2_duplicates"]:
+            for ref, count in sorted(comparison["duplicates_summary"]["file_2_duplicates"].items()):
+                f.write(f"  {ref}: {count}\n")
+        else:
+            f.write("  None\n")
+
+
+def print_summary(comparison: dict) -> None:
+    print("\nREFERENCE COMPARISON REPORT")
+    print("=" * 70)
+
+    print("\nRULES USED")
+    print("-" * 70)
+    print("1. Only lines starting with 'Reference number' are matched.")
+    print("2. 'UETR Reference number' is excluded.")
+    print(f"3. References longer than {MAX_REFERENCE_LENGTH} characters are flagged.")
+
+    print("\nFILE TOTALS")
+    print("-" * 70)
+    print(f"File 1 - Total refs:  {comparison['file_1']['total_reference_count']}")
+    print(f"File 1 - Unique refs: {comparison['file_1']['unique_reference_count']}")
+    print(f"File 2 - Total refs:  {comparison['file_2']['total_reference_count']}")
+    print(f"File 2 - Unique refs: {comparison['file_2']['unique_reference_count']}")
+
+    print("\nMATCHING / MISSING")
+    print("-" * 70)
+    print(f"Common refs in both files: {comparison['common_references']['count']}")
+    print(
+        f"Refs in File 1 but not File 2: "
+        f"{comparison['present_in_file_1_not_in_file_2']['count']}"
+    )
+    print(
+        f"Missing % of File 1 unique refs: "
+        f"{comparison['present_in_file_1_not_in_file_2']['missing_percentage_of_file_1_unique_refs']}%"
+    )
+    print(
+        f"Refs in File 2 but not File 1: "
+        f"{comparison['present_in_file_2_not_in_file_1']['count']}"
+    )
+    print(
+        f"Missing % of File 2 unique refs: "
+        f"{comparison['present_in_file_2_not_in_file_1']['missing_percentage_of_file_2_unique_refs']}%"
+    )
+
+    print("\nLONG REFERENCES CHECK")
+    print("-" * 70)
+    print(
+        f"File 1 - refs longer than {MAX_REFERENCE_LENGTH}: "
+        f"{comparison['file_1']['references_longer_than_max']['count']}"
+    )
+    print(
+        f"File 2 - refs longer than {MAX_REFERENCE_LENGTH}: "
+        f"{comparison['file_2']['references_longer_than_max']['count']}"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    if len(sys.argv) < 3:
+        print("Usage: python compare_refs.py <file1> <file2> [output_folder]")
+        sys.exit(1)
+
+    file1 = Path(sys.argv[1])
+    file2 = Path(sys.argv[2])
+    output_dir = Path(sys.argv[3]) if len(sys.argv) > 3 else Path("comparison_output")
+
+    if not file1.exists():
+        print(f"File not found: {file1}")
+        sys.exit(1)
+
+    if not file2.exists():
+        print(f"File not found: {file2}")
+        sys.exit(1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    text1 = read_file(file1)
+    text2 = read_file(file2)
+
+    refs1 = extract_references(text1)
+    refs2 = extract_references(text2)
+
+    comparison = compare_references(refs1, refs2)
+
+    print_summary(comparison)
+
+    # JSON summary
+    summary_json_path = output_dir / "comparison_summary.json"
+    with summary_json_path.open("w", encoding="utf-8") as f:
+        json.dump(comparison, f, indent=2)
+
+    # Text report
+    report_txt_path = output_dir / "comparison_report.txt"
+    write_summary_report(report_txt_path, comparison)
+
+    # CSV exports
+    write_list_csv(
+        output_dir / "refs_in_file1_not_in_file2.csv",
+        "reference",
+        comparison["present_in_file_1_not_in_file_2"]["references"]
+    )
+
+    write_list_csv(
+        output_dir / "refs_in_file2_not_in_file1.csv",
+        "reference",
+        comparison["present_in_file_2_not_in_file_1"]["references"]
+    )
+
+    write_list_csv(
+        output_dir / "common_refs.csv",
+        "reference",
+        comparison["common_references"]["references"]
+    )
+
+    write_list_csv(
+        output_dir / "file1_refs_longer_than_16.csv",
+        "reference",
+        comparison["file_1"]["references_longer_than_max"]["references"]
+    )
+
+    write_list_csv(
+        output_dir / "file2_refs_longer_than_16.csv",
+        "reference",
+        comparison["file_2"]["references_longer_than_max"]["references"]
+    )
+
+    print("\nOutput files written to:", output_dir.resolve())
+    print(" - comparison_summary.json")
+    print(" - comparison_report.txt")
+    print(" - refs_in_file1_not_in_file2.csv")
+    print(" - refs_in_file2_not_in_file1.csv")
+    print(" - common_refs.csv")
+    print(" - file1_refs_longer_than_16.csv")
+    print(" - file2_refs_longer_than_16.csv")
+
+
+if __name__ == "__main__":
+    main()
