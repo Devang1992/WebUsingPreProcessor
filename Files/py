@@ -1,0 +1,185 @@
+import re
+from pathlib import Path
+from collections import Counter
+from typing import List
+
+
+REFERENCE_PATTERN = re.compile(
+    r"Reference\s*Number\s*:\s*(.+)",
+    re.IGNORECASE
+)
+
+
+def extract_reference_numbers(file_path: str) -> List[str]:
+    """
+    Extract all reference numbers from a file.
+
+    Matches lines like:
+    Reference Number: 251008094950SAMM
+
+    Returns all references, including duplicates.
+    """
+    references = []
+
+    with open(file_path, "r", encoding="utf-8", errors="ignore") as file:
+        for line_number, line in enumerate(file, start=1):
+            match = REFERENCE_PATTERN.search(line)
+            if match:
+                reference = match.group(1).strip()
+                if reference:
+                    references.append(reference)
+
+    return references
+
+
+def write_list_file(output_file: Path, title: str, items: List[str]) -> None:
+    """
+    Write a simple titled list file.
+    """
+    with open(output_file, "w", encoding="utf-8") as file:
+        file.write(f"{title}\n")
+        file.write(f"{'=' * len(title)}\n\n")
+
+        if not items:
+            file.write("None\n")
+        else:
+            for item in items:
+                file.write(f"{item}\n")
+
+        file.write(f"\nTotal: {len(items)}\n")
+
+
+def write_duplicate_file(output_file: Path, title: str, duplicate_counter: Counter) -> None:
+    """
+    Write duplicate reference information.
+    """
+    with open(output_file, "w", encoding="utf-8") as file:
+        file.write(f"{title}\n")
+        file.write(f"{'=' * len(title)}\n\n")
+
+        if not duplicate_counter:
+            file.write("No duplicate references found.\n")
+            file.write("\nTotal duplicate reference values: 0\n")
+            return
+
+        for reference, count in sorted(duplicate_counter.items()):
+            file.write(f"{reference} -> {count}\n")
+
+        file.write(f"\nTotal duplicate reference values: {len(duplicate_counter)}\n")
+        file.write(f"Total duplicate occurrences: {sum(duplicate_counter.values())}\n")
+
+
+def compare_reference_files(file1: str, file2: str, output_dir: str = "reference_compare_output") -> None:
+    """
+    Compare reference numbers between two files and write results to output files.
+    """
+    file1_path = Path(file1)
+    file2_path = Path(file2)
+
+    file1_name = file1_path.name
+    file2_name = file2_path.name
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    refs1 = extract_reference_numbers(file1)
+    refs2 = extract_reference_numbers(file2)
+
+    refs1_counter = Counter(refs1)
+    refs2_counter = Counter(refs2)
+
+    refs1_unique = set(refs1)
+    refs2_unique = set(refs2)
+
+    missing_in_file1 = sorted(refs2_unique - refs1_unique)
+    missing_in_file2 = sorted(refs1_unique - refs2_unique)
+    exists_in_both = sorted(refs1_unique & refs2_unique)
+
+    duplicates_in_file1 = Counter({
+        reference: count
+        for reference, count in refs1_counter.items()
+        if count > 1
+    })
+
+    duplicates_in_file2 = Counter({
+        reference: count
+        for reference, count in refs2_counter.items()
+        if count > 1
+    })
+
+    summary_text = f"""
+REFERENCE NUMBER COMPARISON SUMMARY
+==================================
+
+File 1: {file1_name}
+File 2: {file2_name}
+
+Total reference entries in {file1_name}: {len(refs1)}
+Total reference entries in {file2_name}: {len(refs2)}
+
+Unique reference numbers in {file1_name}: {len(refs1_unique)}
+Unique reference numbers in {file2_name}: {len(refs2_unique)}
+
+Missing in {file1_name}: {len(missing_in_file1)}
+Missing in {file2_name}: {len(missing_in_file2)}
+Exists in both files: {len(exists_in_both)}
+
+Duplicate reference values in {file1_name}: {len(duplicates_in_file1)}
+Duplicate reference values in {file2_name}: {len(duplicates_in_file2)}
+""".strip()
+
+    with open(output_path / "summary.txt", "w", encoding="utf-8") as file:
+        file.write(summary_text + "\n")
+
+    write_list_file(
+        output_path / "missing_in_file1.txt",
+        f"Missing in {file1_name}",
+        missing_in_file1
+    )
+
+    write_list_file(
+        output_path / "missing_in_file2.txt",
+        f"Missing in {file2_name}",
+        missing_in_file2
+    )
+
+    write_list_file(
+        output_path / "exists_in_both.txt",
+        f"Exists in both {file1_name} and {file2_name}",
+        exists_in_both
+    )
+
+    write_list_file(
+        output_path / "all_references_in_file1.txt",
+        f"All reference numbers in {file1_name}",
+        refs1
+    )
+
+    write_list_file(
+        output_path / "all_references_in_file2.txt",
+        f"All reference numbers in {file2_name}",
+        refs2
+    )
+
+    write_duplicate_file(
+        output_path / "duplicates_in_file1.txt",
+        f"Duplicate reference numbers in {file1_name}",
+        duplicates_in_file1
+    )
+
+    write_duplicate_file(
+        output_path / "duplicates_in_file2.txt",
+        f"Duplicate reference numbers in {file2_name}",
+        duplicates_in_file2
+    )
+
+    print(summary_text)
+    print(f"\nOutput written to: {output_path.resolve()}")
+
+
+if __name__ == "__main__":
+    # Replace these with your actual file paths
+    file1_path = r"file1.txt"
+    file2_path = r"file2.txt"
+
+    compare_reference_files(file1_path, file2_path)
