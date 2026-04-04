@@ -1,0 +1,341 @@
+application.yml
+kafka:
+  bootstrap-servers: localhost:9092
+  topic: test-batch-topic
+
+producer:
+  enabled: true
+  message-count: 20000
+  delay-ms: 0
+  key-template: key-{{i}}
+
+  headers:
+    mid: mid-{{i}}
+    source: local-test
+    type: batch
+
+  headers-random:
+    PROD_CODE:
+      - P1
+      - P2
+      - P3
+      - P4
+      - P5
+      - P6
+    ADVICE_CODE:
+      - A1
+      - A2
+      - A3
+      - A4
+      - A5
+      - A6
+
+  payload-template: |
+    {
+      "id": "{{i}}",
+      "customer": {
+        "name": "John Doe {{i}}",
+        "address": "123 Main Street Apt {{i}}, Brampton, ON",
+        "zip": "L6P{{i}}"
+      },
+      "message": "This is message {{i}} used for testing long text wrapping and pagination behavior in batch processing."
+    }
+pom.xml dependency
+<dependency>
+    <groupId>org.springframework.kafka</groupId>
+    <artifactId>spring-kafka</artifactId>
+</dependency>
+KafkaTestApplication.java
+package com.example.kafkatest;
+
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+
+@SpringBootApplication
+public class KafkaTestApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(KafkaTestApplication.class, args);
+    }
+}
+ProducerProperties.java
+package com.example.kafkatest.config;
+
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@ConfigurationProperties(prefix = "producer")
+public class ProducerProperties {
+
+    private boolean enabled = true;
+    private int messageCount = 1;
+    private long delayMs = 0;
+    private String keyTemplate = "key-{{i}}";
+    private Map<String, String> headers = new HashMap<>();
+    private Map<String, List<String>> headersRandom = new HashMap<>();
+    private String payloadTemplate = "";
+
+    public boolean isEnabled() {
+        return enabled;
+    }
+
+    public void setEnabled(boolean enabled) {
+        this.enabled = enabled;
+    }
+
+    public int getMessageCount() {
+        return messageCount;
+    }
+
+    public void setMessageCount(int messageCount) {
+        this.messageCount = messageCount;
+    }
+
+    public long getDelayMs() {
+        return delayMs;
+    }
+
+    public void setDelayMs(long delayMs) {
+        this.delayMs = delayMs;
+    }
+
+    public String getKeyTemplate() {
+        return keyTemplate;
+    }
+
+    public void setKeyTemplate(String keyTemplate) {
+        this.keyTemplate = keyTemplate;
+    }
+
+    public Map<String, String> getHeaders() {
+        return headers;
+    }
+
+    public void setHeaders(Map<String, String> headers) {
+        this.headers = headers;
+    }
+
+    public Map<String, List<String>> getHeadersRandom() {
+        return headersRandom;
+    }
+
+    public void setHeadersRandom(Map<String, List<String>> headersRandom) {
+        this.headersRandom = headersRandom;
+    }
+
+    public String getPayloadTemplate() {
+        return payloadTemplate;
+    }
+
+    public void setPayloadTemplate(String payloadTemplate) {
+        this.payloadTemplate = payloadTemplate;
+    }
+}
+KafkaProducerConfig.java
+package com.example.kafkatest.config;
+
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.serialization.StringSerializer;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.core.DefaultKafkaProducerFactory;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.kafka.core.ProducerFactory;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Configuration
+@EnableConfigurationProperties(ProducerProperties.class)
+public class KafkaProducerConfig {
+
+    @Value("${kafka.bootstrap-servers}")
+    private String bootstrapServers;
+
+    @Bean
+    public ProducerFactory<String, String> producerFactory() {
+        Map<String, Object> config = new HashMap<>();
+        config.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        config.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        config.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class);
+        return new DefaultKafkaProducerFactory<>(config);
+    }
+
+    @Bean
+    public KafkaTemplate<String, String> kafkaTemplate() {
+        return new KafkaTemplate<>(producerFactory());
+    }
+}
+TemplateResolver.java
+package com.example.kafkatest.util;
+
+import org.springframework.stereotype.Component;
+
+@Component
+public class TemplateResolver {
+
+    public String resolve(String template, int index) {
+        if (template == null) {
+            return "";
+        }
+        return template.replace("{{i}}", String.valueOf(index));
+    }
+}
+KafkaMessageGenerator.java
+package com.example.kafkatest.runner;
+
+import com.example.kafkatest.config.ProducerProperties;
+import com.example.kafkatest.util.TemplateResolver;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.CommandLineRunner;
+import org.springframework.kafka.core.KafkaTemplate;
+import org.springframework.stereotype.Component;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+
+@Component
+public class KafkaMessageGenerator implements CommandLineRunner {
+
+    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final ProducerProperties producerProperties;
+    private final TemplateResolver templateResolver;
+    private final Random random = new Random();
+
+    @Value("${kafka.topic}")
+    private String topic;
+
+    public KafkaMessageGenerator(KafkaTemplate<String, String> kafkaTemplate,
+                                 ProducerProperties producerProperties,
+                                 TemplateResolver templateResolver) {
+        this.kafkaTemplate = kafkaTemplate;
+        this.producerProperties = producerProperties;
+        this.templateResolver = templateResolver;
+    }
+
+    @Override
+    public void run(String... args) throws Exception {
+        if (!producerProperties.isEnabled()) {
+            System.out.println("Kafka message generator is disabled");
+            return;
+        }
+
+        int count = producerProperties.getMessageCount();
+        long delayMs = producerProperties.getDelayMs();
+
+        System.out.println("Sending " + count + " messages to topic: " + topic);
+
+        for (int i = 1; i <= count; i++) {
+            String key = templateResolver.resolve(producerProperties.getKeyTemplate(), i);
+            String payload = templateResolver.resolve(producerProperties.getPayloadTemplate(), i);
+
+            ProducerRecord<String, String> record = new ProducerRecord<>(topic, key, payload);
+
+            for (Map.Entry<String, String> entry : producerProperties.getHeaders().entrySet()) {
+                String headerValue = templateResolver.resolve(entry.getValue(), i);
+                record.headers().add(entry.getKey(), headerValue.getBytes(StandardCharsets.UTF_8));
+            }
+
+            for (Map.Entry<String, List<String>> entry : producerProperties.getHeadersRandom().entrySet()) {
+                List<String> values = entry.getValue();
+                if (values != null && !values.isEmpty()) {
+                    String randomValue = values.get(random.nextInt(values.size()));
+                    record.headers().add(entry.getKey(), randomValue.getBytes(StandardCharsets.UTF_8));
+                }
+            }
+
+            kafkaTemplate.send(record);
+
+            if (delayMs > 0) {
+                Thread.sleep(delayMs);
+            }
+
+            if (i % 1000 == 0) {
+                System.out.println("Sent " + i + " messages");
+            }
+        }
+
+        kafkaTemplate.flush();
+        System.out.println("Done sending messages");
+    }
+}
+Folder structure
+src/main/java/com/example/kafkatest/
+ ┣ KafkaTestApplication.java
+ ┣ config/
+ ┃ ┣ KafkaProducerConfig.java
+ ┃ ┗ ProducerProperties.java
+ ┣ runner/
+ ┃ ┗ KafkaMessageGenerator.java
+ ┗ util/
+   ┗ TemplateResolver.java
+How to use
+
+Set this:
+
+producer:
+  enabled: true
+  message-count: 20000
+
+Start app, and it sends.
+
+If you want to stop sending on startup:
+
+producer:
+  enabled: false
+Example config changes
+Same header for every message
+producer:
+  headers:
+    source: fixed-source
+Unique header per message
+producer:
+  headers:
+    mid: mid-{{i}}
+Random template-driving headers
+producer:
+  headers-random:
+    PROD_CODE:
+      - P1
+      - P2
+      - P3
+    ADVICE_CODE:
+      - A1
+      - A2
+      - A3
+Smaller test
+producer:
+  message-count: 2000
+Longer messages for word wrap testing
+producer:
+  payload-template: |
+    {
+      "id": "{{i}}",
+      "message": "This is a very long message for record {{i}} and it is intentionally large so that word wrapping, pagination, and fixed width generation can be stress tested properly in the batch flow."
+    }
+One important note
+
+This uses:
+
+kafkaTemplate.send(record);
+
+which is fine for quick local load generation.
+
+If later you want stricter testing, you can make it wait on each send result, but for now this is the simplest practical version.
+
+Small improvement I’d suggest right away
+
+If you want to avoid accidental huge sends during startup, set default as:
+
+producer:
+  enabled: false
+
+and turn it on only when testing.
