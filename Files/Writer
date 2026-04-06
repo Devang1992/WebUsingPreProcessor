@@ -1,0 +1,390 @@
+Refactor generator interface
+BatchTemplateGenerator.java
+package com.td.payments.pants.mailservice.job.transformer;
+
+import java.io.IOException;
+import java.io.Writer;
+
+public interface BatchTemplateGenerator {
+    void writeTemplate(String message, Writer writer) throws IOException;
+}
+2. Refactor generator implementation
+
+This keeps your current logic, but instead of returning one giant String, it writes page-by-page.
+
+BatchTemplateGeneratorImp.java
+package com.td.payments.pants.mailservice.job.transformer;
+
+import lombok.RequiredArgsConstructor;
+import org.springframework.lang.Nullable;
+import org.springframework.stereotype.Component;
+import org.springframework.util.StringUtils;
+
+import java.io.IOException;
+import java.io.Writer;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.regex.Pattern;
+
+@Component
+@RequiredArgsConstructor
+public class BatchTemplateGeneratorImp implements BatchTemplateGenerator {
+
+    private static final int PAGE_LINES = 66;
+    private static final int CONTENT_LAST_LINE = 62;
+    private static final int LINE_ID_LINE = 1;
+    private static final int FIRST_PAGE_HASH_LINE = 2;
+    private static final int FIRST_PAGE_ADDRESS_START = 17;
+    private static final int NEXT_PAGE_ADDRESS_START = 8;
+    private static final int PAGE_NUMBER_LINE = 66;
+    private static final int LINE_LENGTH = 133;
+    private static final int MAX_CONTENT_PER_LINE = 75;
+
+    private static final String WRAP_INDEX_MARKER = "Wrap_Index";
+    private static final String EOL = "\r\n";
+    private static final String END_ADDRESS_MARKER = "[END_ADDRESS]";
+    private static final String SKIP_LINE_MARKER = "_SKIP_LINE_";
+    private static final String BLANK_LINE = " ".repeat(LINE_LENGTH);
+
+    @Override
+    public void writeTemplate(String message, Writer writer) throws IOException {
+        SplitResult result = extractLines(message);
+        List<String> contentLines = result.contentLines();
+        List<String> addressBlock = result.addressBlock();
+
+        boolean firstPage = true;
+        int idx = 0;
+        int pageCounter = 1;
+
+        while (idx < contentLines.size()) {
+            List<String> page = blankPage();
+
+            addHeader(page, firstPage);
+            int contentStart = addAddress(page, addressBlock, firstPage);
+            idx = addContent(page, contentLines, idx, contentStart);
+            addPageNumber(page, pageCounter++);
+
+            writePage(page, writer);
+            firstPage = false;
+        }
+    }
+
+    private void writePage(List<String> page, Writer writer) throws IOException {
+        for (String line : page) {
+            writer.write(line);
+            writer.write(EOL);
+        }
+    }
+
+    private void addHeader(List<String> page, boolean firstPage) {
+        page.set(LINE_ID_LINE - 1, pad("1"));
+        if (firstPage) {
+            page.set(FIRST_PAGE_HASH_LINE - 1, pad("##"));
+        }
+    }
+
+    private int addAddress(List<String> page, List<String> addressBlock, boolean firstPage) {
+        int addressStart = firstPage ? FIRST_PAGE_ADDRESS_START : NEXT_PAGE_ADDRESS_START;
+
+        if (firstPage) {
+            int singleLine = addressStart;
+            for (String addr : addressBlock) {
+                if (singleLine > CONTENT_LAST_LINE) {
+                    break;
+                }
+                page.set(singleLine - 1, pad(addr));
+                singleLine++;
+            }
+            return addressStart + addressBlock.size();
+        }
+
+        return addressStart;
+    }
+
+    private int addContent(List<String> page, List<String> contentLines, int idx, int contentStart) {
+        int linePtr = contentStart;
+        while (idx < contentLines.size() && linePtr <= CONTENT_LAST_LINE) {
+            page.set(linePtr - 1, pad(contentLines.get(idx++)));
+            linePtr++;
+        }
+        return idx;
+    }
+
+    private void addPageNumber(List<String> page, int pageCounter) {
+        page.set(PAGE_NUMBER_LINE - 1, pad(String.format(" Page %02d", pageCounter)));
+    }
+
+    private SplitResult extractLines(String message) {
+        List<String> contentLines = new ArrayList<>();
+        List<String> addressBlock = new ArrayList<>();
+
+        String[] lines = message.split("\\r?\\n");
+        boolean isAddressBlock = true;
+        int lineWrapIndentation = 2;
+
+        for (String line : lines) {
+            boolean shouldContinue = false;
+
+            int updatedIndentation = updateLineWrapIndentation(line);
+            if (updatedIndentation != -1) {
+                lineWrapIndentation = updatedIndentation;
+                shouldContinue = true;
+            }
+
+            if (!shouldContinue) {
+                line = processSkipLineMarker(line);
+                if (line == null) {
+                    shouldContinue = true;
+                }
+            }
+
+            if (shouldContinue) {
+                continue;
+            }
+
+            if (StringUtils.hasText(line) && line.contains(END_ADDRESS_MARKER)) {
+                processEndAddressMarker(line, addressBlock, contentLines);
+                isAddressBlock = false;
+            } else if (isAddressBlock) {
+                processAddressBlock(line, addressBlock, contentLines);
+            } else {
+                processContentLine(line, contentLines, lineWrapIndentation);
+            }
+        }
+
+        return new SplitResult(addressBlock, contentLines);
+    }
+
+    private int updateLineWrapIndentation(String line) {
+        if (line.contains(WRAP_INDEX_MARKER)) {
+            return line.contains("Wrap_Index_CoverPaymentContent") ? 4 : 39;
+        }
+        return -1;
+    }
+
+    @Nullable
+    private String processSkipLineMarker(String line) {
+        if (line.contains(SKIP_LINE_MARKER)) {
+            String processed = line.replace(SKIP_LINE_MARKER, "").replace("\t", "");
+            if (processed.isBlank()) {
+                return null;
+            }
+            return processed;
+        }
+        return line;
+    }
+
+    private void processEndAddressMarker(String line, List<String> addressBlock, List<String> contentLines) {
+        String processedLine = line.replace(END_ADDRESS_MARKER, "");
+        addressBlock.add(processedLine);
+        contentLines.add(processedLine);
+    }
+
+    private void processAddressBlock(@Nullable String line, List<String> addressBlock, List<String> contentLines) {
+        addressBlock.add(line);
+        contentLines.add(line);
+    }
+
+    private void processContentLine(@Nullable String line, List<String> contentLines, int lineWrapIndentation) {
+        if (StringUtils.hasText(line) && line.length() > MAX_CONTENT_PER_LINE) {
+            contentLines.addAll(WordWrap.wrapLines(line, MAX_CONTENT_PER_LINE, lineWrapIndentation));
+        } else {
+            contentLines.add(line);
+        }
+    }
+
+    private List<String> blankPage() {
+        return new ArrayList<>(Collections.nCopies(PAGE_LINES, BLANK_LINE));
+    }
+
+    private static String pad(String s) {
+        if (s == null) {
+            s = "";
+        }
+        if (s.length() >= LINE_LENGTH) {
+            return s.substring(0, LINE_LENGTH);
+        }
+        return s + BLANK_LINE.substring(s.length());
+    }
+}
+3. SplitResult.java
+
+If you already have this, keep yours. Otherwise:
+
+package com.td.payments.pants.mailservice.job.transformer;
+
+import java.util.List;
+
+public record SplitResult(List<String> addressBlock, List<String> contentLines) {
+}
+4. Local file writer for Spring Batch
+
+This writer opens one temp/local file for the step and appends all generated output into it.
+
+LocalFlatFileItemWriter.java
+package com.td.payments.pants.mailservice.job.writer;
+
+import com.td.payments.pants.mailservice.job.transformer.BatchTemplateGenerator;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.batch.item.Chunk;
+import org.springframework.batch.item.ExecutionContext;
+import org.springframework.batch.item.ItemStreamException;
+import org.springframework.batch.item.ItemStreamWriter;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.Profile;
+import org.springframework.stereotype.Component;
+
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+@Slf4j
+@Component
+@Profile("itest")
+public class LocalFlatFileItemWriter implements ItemStreamWriter<String> {
+
+    public static final String OUTPUT_FILE_PATH = "batch.output.file.path";
+
+    private final BatchTemplateGenerator batchTemplateGenerator;
+
+    @Value("${batch.output.directory:./build/batch-output}")
+    private String outputDirectory;
+
+    @Value("${batch.output.file-name:test-output.txt}")
+    private String outputFileName;
+
+    private BufferedWriter writer;
+    private Path outputFile;
+
+    public LocalFlatFileItemWriter(BatchTemplateGenerator batchTemplateGenerator) {
+        this.batchTemplateGenerator = batchTemplateGenerator;
+    }
+
+    @Override
+    public void open(ExecutionContext executionContext) throws ItemStreamException {
+        try {
+            Path dir = Path.of(outputDirectory);
+            Files.createDirectories(dir);
+
+            outputFile = dir.resolve(outputFileName);
+
+            writer = Files.newBufferedWriter(
+                    outputFile,
+                    StandardCharsets.UTF_8
+            );
+
+            executionContext.putString(OUTPUT_FILE_PATH, outputFile.toAbsolutePath().toString());
+
+            log.info("Opened local batch output file at {}", outputFile.toAbsolutePath());
+        } catch (IOException e) {
+            throw new ItemStreamException("Failed to open local batch output file", e);
+        }
+    }
+
+    @Override
+    public void write(Chunk<? extends String> chunk) throws Exception {
+        for (String item : chunk.getItems()) {
+            batchTemplateGenerator.writeTemplate(item, writer);
+        }
+        writer.flush();
+    }
+
+    @Override
+    public void update(ExecutionContext executionContext) throws ItemStreamException {
+        if (outputFile != null) {
+            executionContext.putString(OUTPUT_FILE_PATH, outputFile.toAbsolutePath().toString());
+        }
+    }
+
+    @Override
+    public void close() throws ItemStreamException {
+        if (writer != null) {
+            try {
+                writer.close();
+                log.info("Closed local batch output file at {}", outputFile.toAbsolutePath());
+            } catch (IOException e) {
+                throw new ItemStreamException("Failed to close local batch output file", e);
+            }
+        }
+    }
+}
+5. Batch config for local test
+
+You likely already have a step config. For local testing, just swap the writer bean.
+
+Example step
+@Bean
+@Profile("itest")
+public Step localFileWriteStep(JobRepository jobRepository,
+                               PlatformTransactionManager transactionManager,
+                               ItemReader<String> batchKafkaReader,
+                               ItemProcessor<String, String> templateProcessor,
+                               LocalFlatFileItemWriter localFlatFileItemWriter) {
+    return new StepBuilder("localFileWriteStep", jobRepository)
+            .<String, String>chunk(500, transactionManager)
+            .reader(batchKafkaReader)
+            .processor(templateProcessor)
+            .writer(localFlatFileItemWriter)
+            .build();
+}
+
+If your processor output type is not String, adjust the generic types to match your project.
+
+6. Config in application-local.yml or application-itest.yml
+batch:
+  output:
+    directory: ./build/batch-output
+    file-name: local-batch-test.txt
+
+That will write locally to something like:
+
+./build/batch-output/local-batch-test.txt
+7. Optional tasklet just to print file info after step
+
+This is nice for local verification before SFTP.
+
+LocalFileInfoTasklet.java
+package com.td.payments.pants.mailservice.job.component;
+
+import com.td.payments.pants.mailservice.job.writer.LocalFlatFileItemWriter;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.batch.core.StepContribution;
+import org.springframework.batch.core.scope.context.ChunkContext;
+import org.springframework.batch.core.step.tasklet.Tasklet;
+import org.springframework.batch.repeat.RepeatStatus;
+import org.springframework.stereotype.Component;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+@Slf4j
+@Component
+public class LocalFileInfoTasklet implements Tasklet {
+
+    @Override
+    public RepeatStatus execute(StepContribution contribution, ChunkContext chunkContext) throws Exception {
+        String filePath = contribution.getStepExecution()
+                .getJobExecution()
+                .getExecutionContext()
+                .getString(LocalFlatFileItemWriter.OUTPUT_FILE_PATH, null);
+
+        if (filePath == null) {
+            log.warn("No output file path found in execution context");
+            return RepeatStatus.FINISHED;
+        }
+
+        Path path = Path.of(filePath);
+        if (Files.exists(path)) {
+            long size = Files.size(path);
+            log.info("Local output file created: {}", path.toAbsolutePath());
+            log.info("Local output file size: {} bytes", size);
+        } else {
+            log.warn("Output file does not exist: {}", filePath);
+        }
+
+        return RepeatStatus.FINISHED;
+    }
+}
