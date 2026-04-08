@@ -18,3 +18,25 @@ private static final String CRLF = "\r\n";
 
         return normalized.replace("\n", CRLF);
     }
+
+
+public final class BannerWrapper {
+
+    private static final String CRLF = "\r\n";
+
+    private BannerWrapper() {
+    }
+
+    public static String wrap(String rawBanner) {
+        if (rawBanner == null || rawBanner.isBlank()) {
+            return "";
+        }
+
+        String normalized = rawBanner
+                .replace("\r\n", "\n")
+                .replace("\r", "\n")
+                .replaceAll("\n+$", "");
+
+        return normalized.replace("\n", CRLF) + CRLF;
+    }
+}
