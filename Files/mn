@@ -1,0 +1,28 @@
+private static final int LINE_LENGTH = 134;
+    private static final String CRLF = "\r\n";
+
+    public static String formatBanner(String banner) {
+        if (banner == null || banner.isBlank()) {
+            return "";
+        }
+
+        List<String> formattedLines = Arrays.stream(banner.replace("\r", "").split("\n", -1))
+                .map(String::stripTrailing)          // remove hidden trailing spaces/tabs
+                .filter(line -> !line.trim().isEmpty()) // remove fully blank lines
+                .map(BannerFormatter::padOrTrim)
+                .collect(Collectors.toList());
+
+        if (formattedLines.isEmpty()) {
+            return "";
+        }
+
+        // important: join real lines only
+        return String.join(CRLF, formattedLines) + CRLF;
+    }
+
+    private static String padOrTrim(String line) {
+        if (line.length() > LINE_LENGTH) {
+            return line.substring(0, LINE_LENGTH);
+        }
+        return String.format("%-" + LINE_LENGTH + "s", line);
+    }
