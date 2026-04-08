@@ -32,3 +32,23 @@ private static final int LINE_LENGTH = 134;
         // pad if shorter
         return String.format("%-" + LINE_LENGTH + "s", line);
     }
+
+
+
+public static String removeTrailingBlankLine(String input) {
+    if (input == null || input.isEmpty()) {
+        return input;
+    }
+
+    // Normalize for safety
+    String normalized = input.replace("\r", "");
+
+    String[] lines = normalized.split("\n", -1);
+
+    // If last line is blank → remove it
+    if (lines.length > 0 && lines[lines.length - 1].trim().isEmpty()) {
+        return String.join("\n", java.util.Arrays.copyOf(lines, lines.length - 1));
+    }
+
+    return input;
+}
