@@ -1,0 +1,43 @@
+@Test
+    void shouldFormatTorontoTimestamp_whenUtcIsJustAfterMidnight() {
+        BatchFileProperties properties = new BatchFileProperties();
+        properties.setDatePattern("yyyy-MM-dd HH:mm:ss");
+        properties.setFileExtension(".txt");
+        properties.setNameFormatPrefixManual("MANUAL_");
+        properties.setNameFormatPrefixAuto("AUTO_");
+
+        Clock fixedClock = Clock.fixed(
+                Instant.parse("2026-04-09T00:30:00Z"),
+                ZoneOffset.UTC
+        );
+
+        try (MockedStatic<Clock> mockedClock = mockStatic(Clock.class)) {
+            mockedClock.when(Clock::systemUTC).thenReturn(fixedClock);
+
+            String result = properties.formatAsTorontoTimestamp();
+
+            assertEquals("2026-04-08 20:30:00", result);
+        }
+    }
+
+    @Test
+    void shouldBuildManualFileName() {
+        BatchFileProperties properties = new BatchFileProperties();
+        properties.setDatePattern("yyyyMMddHHmmss");
+        properties.setFileExtension(".txt");
+        properties.setNameFormatPrefixManual("MANUAL_");
+        properties.setNameFormatPrefixAuto("AUTO_");
+
+        Clock fixedClock = Clock.fixed(
+                Instant.parse("2026-04-09T03:00:00Z"),
+                ZoneOffset.UTC
+        );
+
+        try (MockedStatic<Clock> mockedClock = mockStatic(Clock.class)) {
+            mockedClock.when(Clock::systemUTC).thenReturn(fixedClock);
+
+            String result = properties.getFileName(true);
+
+            assertEquals("MANUAL_20260408230000.txt", result);
+        }
+    }
