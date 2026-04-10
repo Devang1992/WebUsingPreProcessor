@@ -1,0 +1,116 @@
+import org.junit.jupiter.api.Test;
+import org.mockito.MockedStatic;
+import org.mockito.Mockito;
+
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.Mockito.mockStatic;
+
+class BatchFilePropertiesTest {
+
+    private BatchFileProperties buildProps(String datePattern) {
+        BatchFileProperties props = new BatchFileProperties(
+            "AUTO_", "MANUAL_", datePattern, ".csv"
+        );
+        return props;
+    }
+
+    // ─── Scenario 1: UTC behind Eastern ───────────────────────────────────────
+    // During EDT (summer, UTC-4): UTC 15:00 → Eastern 11:00
+    @Test
+    void duringDaylightSaving_UTC_isAheadOfEastern() {
+        Instant fixed = Instant.parse("2024-07-15T15:00:00Z"); // Summer, EDT active
+
+        try (MockedStatic<Clock> clockMock = mockStatic(Clock.class)) {
+            Clock mockClock = Clock.fixed(fixed, ZoneOffset.UTC);
+            clockMock.when(Clock::systemUTC).thenReturn(mockClock);
+
+            String result = buildProps("yyyy-MM-dd HH:mm:ss").formatAsEasternTimestamp();
+
+            // UTC 15:00 - 4hrs (EDT) = 11:00
+            assertThat(result).isEqualTo("2024-07-15 11:00:00");
+        }
+    }
+
+    // ─── Scenario 2: No DST (winter, EST = UTC-5) ─────────────────────────────
+    // During EST (winter, UTC-5): UTC 15:00 → Eastern 10:00
+    @Test
+    void duringStandardTime_UTC_isFiveHoursAheadOfEastern() {
+        Instant fixed = Instant.parse("2024-01-15T15:00:00Z"); // Winter, EST active
+
+        try (MockedStatic<Clock> clockMock = mockStatic(Clock.class)) {
+            Clock mockClock = Clock.fixed(fixed, ZoneOffset.UTC);
+            clockMock.when(Clock::systemUTC).thenReturn(mockClock);
+
+            String result = buildProps("yyyy-MM-dd HH:mm:ss").formatAsEasternTimestamp();
+
+            // UTC 15:00 - 5hrs (EST) = 10:00
+            assertThat(result).isEqualTo("2024-01-15 10:00:00");
+        }
+    }
+
+    // ─── Scenario 3: Machine "ahead" of Eastern (e.g. UTC+5:30 India) ─────────
+    // Doesn't matter — Clock.systemUTC() always gives UTC, machine zone irrelevant
+    // UTC 00:30 → EST (winter) = previous day 19:30
+    @Test
+    void midnightUTC_rollsBackToPreviousDayInEastern_duringWinter() {
+        Instant fixed = Instant.parse("2024-01-15T00:30:00Z"); // Just after UTC midnight
+
+        try (MockedStatic<Clock> clockMock = mockStatic(Clock.class)) {
+            Clock mockClock = Clock.fixed(fixed, ZoneOffset.UTC);
+            clockMock.when(Clock::systemUTC).thenReturn(mockClock);
+
+            String result = buildProps("yyyy-MM-dd HH:mm:ss").formatAsEasternTimestamp();
+
+            // UTC 00:30 - 5hrs = previous day 19:30
+            assertThat(result).isEqualTo("2024-01-14 19:30:00");
+        }
+    }
+
+    // ─── Scenario 4: DST boundary — spring forward (2024-03-10 02:00 EST→EDT) ──
+    // Just before: UTC 06:59 → EST 01:59
+    // Just after:  UTC 07:00 → EDT 03:00 (clocks jump from 2am to 3am)
+    @Test
+    void dstSpringForward_justBefore_isEST() {
+        Instant fixed = Instant.parse("2024-03-10T06:59:00Z");
+
+        try (MockedStatic<Clock> clockMock = mockStatic(Clock.class)) {
+            clockMock.when(Clock::systemUTC).thenReturn(Clock.fixed(fixed, ZoneOffset.UTC));
+
+            String result = buildProps("yyyy-MM-dd HH:mm:ss").formatAsEasternTimestamp();
+
+            assertThat(result).isEqualTo("2024-03-10 01:59:00"); // Still EST (-5)
+        }
+    }
+
+    @Test
+    void dstSpringForward_justAfter_isEDT() {
+        Instant fixed = Instant.parse("2024-03-10T07:00:00Z");
+
+        try (MockedStatic<Clock> clockMock = mockStatic(Clock.class)) {
+            clockMock.when(Clock::systemUTC).thenReturn(Clock.fixed(fixed, ZoneOffset.UTC));
+
+            String result = buildProps("yyyy-MM-dd HH:mm:ss").formatAsEasternTimestamp();
+
+            assertThat(result).isEqualTo("2024-03-10 03:00:00"); // EDT kicks in (-4), jumps to 3am
+        }
+    }
+
+    // ─── Scenario 5: DST fall back (2024-11-03 02:00 EDT→EST) ────────────────
+    // UTC 06:00 → EDT would be 02:00, but clocks fall back → EST 01:00
+    @Test
+    void dstFallBack_clocksFallBack_toEST() {
+        Instant fixed = Instant.parse("2024-11-03T06:00:00Z");
+
+        try (MockedStatic<Clock> clockMock = mockStatic(Clock.class)) {
+            clockMock.when(Clock::systemUTC).thenReturn(Clock.fixed(fixed, ZoneOffset.UTC));
+
+            String result = buildProps("yyyy-MM-dd HH:mm:ss").formatAsEasternTimestamp();
+
+            assertThat(result).isEqualTo("2024-11-03 01:00:00"); // Fell back to EST (-5)
+        }
+    }
+}
