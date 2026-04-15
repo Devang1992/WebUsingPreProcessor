@@ -1,0 +1,61 @@
+protected boolean isStatusExistInSkipList(Headers headers, MessageHeaders messageHeaders) {
+    String rawChannelCode = KafkaHeaderUtils.lastStringHeader(headers, KafkaHeaders.CHANNEL_CODE);
+    String rawStatus = MessageHeaderUtils.getHeaderString(KafkaHeaders.MESSAGE_STATUS, messageHeaders);
+
+    String channelCode = normalize(rawChannelCode);
+    String status = normalize(rawStatus);
+
+    if (status == null) {
+        return false;
+    }
+
+    Set<String> statusesToSuppress = getStatusesToSuppress(channelCode);
+
+    if (statusesToSuppress.contains(status)) {
+        log.info("[{}] Message suppressed. [mid={}, status={}, channel={}]",
+                pdmFlowType.name(),
+                MessageHeaderUtils.getHeaderString(KafkaHeaders.MID, messageHeaders),
+                status,
+                channelCode);
+        return true;
+    }
+
+    return false;
+}
+
+private Set<String> getStatusesToSuppress(String channelCode) {
+    Map<String, Set<String>> configuredMap = filterProperties.getChannelHeaders();
+    if (configuredMap == null || configuredMap.isEmpty()) {
+        return Set.of();
+    }
+
+    Set<String> result = new HashSet<>();
+
+    Set<String> allStatuses = configuredMap.get(ALL_CHANNELS);
+    if (allStatuses != null) {
+        allStatuses.stream()
+                .map(this::normalize)
+                .filter(Objects::nonNull)
+                .forEach(result::add);
+    }
+
+    if (channelCode != null) {
+        Set<String> channelSpecificStatuses = configuredMap.get(channelCode);
+        if (channelSpecificStatuses != null) {
+            channelSpecificStatuses.stream()
+                    .map(this::normalize)
+                    .filter(Objects::nonNull)
+                    .forEach(result::add);
+        }
+    }
+
+    return result;
+}
+
+private String normalize(String value) {
+    if (value == null) {
+        return null;
+    }
+    String trimmed = value.trim();
+    return trimmed.isEmpty() ? null : trimmed.toUpperCase(Locale.ROOT);
+}
