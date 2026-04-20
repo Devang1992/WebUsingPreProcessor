@@ -1,0 +1,72 @@
+protected List<NotificationsSummary> getCorrectResults(List<NotificationsSummary> results, boolean isRetryable) {
+    if (results.isEmpty()) {
+        throw new PantsException(
+                PantsErrorCode.DATABASE_ADVICE_RETRIEVAL_ERROR,
+                "No record found for notifications information",
+                isRetryable
+        );
+    }
+
+    if (results.size() == 1) {
+        return List.of(results.get(0));
+    }
+
+    Map<String, NotificationsSummary> distinctAdviceMap = results.stream()
+            .collect(Collectors.toMap(
+                    result -> {
+                        String code = result.getAdviceCode();
+                        return code == null ? null : code.trim();
+                    },
+                    Function.identity(),
+                    (first, second) -> first,
+                    LinkedHashMap::new
+            ));
+
+    if (distinctAdviceMap.size() == 1) {
+        return List.of(results.get(0));
+    }
+
+    return new ArrayList<>(distinctAdviceMap.values());
+}
+
+
+protected List<NotificationsSummary> getCorrectResults(List<NotificationsSummary> results, boolean isRetryable) {
+    if (results.isEmpty()) {
+        throw new PantsException(
+                PantsErrorCode.DATABASE_ADVICE_RETRIEVAL_ERROR,
+                "No record found for notifications information",
+                isRetryable
+        );
+    }
+
+    if (results.size() == 1) {
+        return List.of(results.get(0));
+    }
+
+    // Step 1: Separate non-null advice codes
+    List<NotificationsSummary> nonNullAdvice = results.stream()
+            .filter(r -> r.getAdviceCode() != null && !r.getAdviceCode().trim().isEmpty())
+            .toList();
+
+    // Step 2: Decide which list to process
+    List<NotificationsSummary> workingList = !nonNullAdvice.isEmpty() ? nonNullAdvice : results;
+
+    // Step 3: Deduplicate by adviceCode (null safe)
+    Map<String, NotificationsSummary> distinctMap = workingList.stream()
+            .collect(Collectors.toMap(
+                    r -> {
+                        String code = r.getAdviceCode();
+                        return code == null ? null : code.trim();
+                    },
+                    Function.identity(),
+                    (first, second) -> first,
+                    LinkedHashMap::new
+            ));
+
+    // Step 4: If only one distinct → return first original
+    if (distinctMap.size() == 1) {
+        return List.of(results.get(0));
+    }
+
+    return new ArrayList<>(distinctMap.values());
+}
