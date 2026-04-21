@@ -1,0 +1,241 @@
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+class NotificationsSummaryDaoImpTest {
+
+    private final TestableNotificationsSummaryDaoImp dao = new TestableNotificationsSummaryDaoImp();
+
+    @Test
+    @DisplayName("Should throw exception when results list is empty")
+    void shouldThrowExceptionWhenResultsEmpty() {
+        PantsException ex = assertThrows(
+                PantsException.class,
+                () -> dao.callGetCorrectResults(List.of(), true)
+        );
+
+        assertEquals(PantsErrorCode.DATABASE_ADVICE_RETRIEVAL_ERROR, ex.getErrorCode());
+        assertEquals("No record found for notifications information", ex.getMessage());
+        assertTrue(ex.isRetryable());
+    }
+
+    @Test
+    @DisplayName("Should return single item when only one result exists")
+    void shouldReturnSingleItemWhenOnlyOneResultExists() {
+        NotificationsSummary summary = summary("ABC");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(List.of(summary), false);
+
+        assertEquals(1, actual.size());
+        assertSame(summary, actual.get(0));
+    }
+
+    @Test
+    @DisplayName("Should return first item only when all advice codes are same")
+    void shouldReturnFirstItemOnlyWhenAllAdviceCodesAreSame() {
+        NotificationsSummary first = summary("ABC");
+        NotificationsSummary second = summary("ABC");
+        NotificationsSummary third = summary("ABC");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(first, second, third), false
+        );
+
+        assertEquals(1, actual.size());
+        assertSame(first, actual.get(0));
+    }
+
+    @Test
+    @DisplayName("Should trim advice code and treat trimmed duplicates as same")
+    void shouldTrimAdviceCodeAndTreatTrimmedDuplicatesAsSame() {
+        NotificationsSummary first = summary(" ABC ");
+        NotificationsSummary second = summary("ABC");
+        NotificationsSummary third = summary("  ABC");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(first, second, third), false
+        );
+
+        assertEquals(1, actual.size());
+        assertSame(first, actual.get(0));
+    }
+
+    @Test
+    @DisplayName("Should return one entry per distinct non-blank advice code")
+    void shouldReturnOneEntryPerDistinctNonBlankAdviceCode() {
+        NotificationsSummary firstA = summary("A");
+        NotificationsSummary firstB = summary("B");
+        NotificationsSummary secondA = summary("A");
+        NotificationsSummary firstC = summary("C");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(firstA, firstB, secondA, firstC), false
+        );
+
+        assertEquals(3, actual.size());
+        assertSame(firstA, actual.get(0));
+        assertSame(firstB, actual.get(1));
+        assertSame(firstC, actual.get(2));
+    }
+
+    @Test
+    @DisplayName("Should preserve insertion order for distinct advice codes")
+    void shouldPreserveInsertionOrderForDistinctAdviceCodes() {
+        NotificationsSummary firstB = summary("B");
+        NotificationsSummary firstA = summary("A");
+        NotificationsSummary firstC = summary("C");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(firstB, firstA, firstC), false
+        );
+
+        assertEquals(3, actual.size());
+        assertSame(firstB, actual.get(0));
+        assertSame(firstA, actual.get(1));
+        assertSame(firstC, actual.get(2));
+    }
+
+    @Test
+    @DisplayName("Should ignore null advice codes when at least one real advice code exists")
+    void shouldIgnoreNullAdviceCodesWhenRealAdviceExists() {
+        NotificationsSummary null1 = summary(null);
+        NotificationsSummary null2 = summary(null);
+        NotificationsSummary abc = summary("ABC");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(null1, null2, abc), false
+        );
+
+        assertEquals(1, actual.size());
+        assertSame(abc, actual.get(0));
+    }
+
+    @Test
+    @DisplayName("Should ignore blank advice codes when at least one real advice code exists")
+    void shouldIgnoreBlankAdviceCodesWhenRealAdviceExists() {
+        NotificationsSummary blank = summary("");
+        NotificationsSummary spaces = summary("   ");
+        NotificationsSummary abc = summary("ABC");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(blank, spaces, abc), false
+        );
+
+        assertEquals(1, actual.size());
+        assertSame(abc, actual.get(0));
+    }
+
+    @Test
+    @DisplayName("Should ignore null and blank advice codes when real advice codes exist")
+    void shouldIgnoreNullAndBlankAdviceCodesWhenRealAdviceExists() {
+        NotificationsSummary nullValue = summary(null);
+        NotificationsSummary blank = summary("");
+        NotificationsSummary spaces = summary("   ");
+        NotificationsSummary abc = summary("ABC");
+        NotificationsSummary xyz = summary("XYZ");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(nullValue, blank, spaces, abc, xyz), false
+        );
+
+        assertEquals(2, actual.size());
+        assertSame(abc, actual.get(0));
+        assertSame(xyz, actual.get(1));
+    }
+
+    @Test
+    @DisplayName("Should return one null bucket when all advice codes are null")
+    void shouldReturnOneNullBucketWhenAllAdviceCodesAreNull() {
+        NotificationsSummary first = summary(null);
+        NotificationsSummary second = summary(null);
+        NotificationsSummary third = summary(null);
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(first, second, third), false
+        );
+
+        assertEquals(1, actual.size());
+        assertSame(first, actual.get(0));
+    }
+
+    @Test
+    @DisplayName("Should treat blank and spaces as null bucket when all values are blank")
+    void shouldTreatBlankAndSpacesAsNullBucketWhenAllValuesAreBlank() {
+        NotificationsSummary blank = summary("");
+        NotificationsSummary spaces = summary("   ");
+        NotificationsSummary tabs = summary("     ");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(blank, spaces, tabs), false
+        );
+
+        assertEquals(1, actual.size());
+        assertSame(blank, actual.get(0));
+    }
+
+    @Test
+    @DisplayName("Should treat null blank and spaces as same bucket when no real advice exists")
+    void shouldTreatNullBlankAndSpacesAsSameBucketWhenNoRealAdviceExists() {
+        NotificationsSummary nullValue = summary(null);
+        NotificationsSummary blank = summary("");
+        NotificationsSummary spaces = summary("   ");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(nullValue, blank, spaces), false
+        );
+
+        assertEquals(1, actual.size());
+        assertSame(nullValue, actual.get(0));
+    }
+
+    @Test
+    @DisplayName("Should keep first occurrence for each distinct trimmed advice code")
+    void shouldKeepFirstOccurrenceForEachDistinctTrimmedAdviceCode() {
+        NotificationsSummary firstA = summary(" A ");
+        NotificationsSummary secondA = summary("A");
+        NotificationsSummary firstB = summary(" B ");
+        NotificationsSummary secondB = summary("B");
+        NotificationsSummary firstC = summary("C");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(firstA, secondA, firstB, secondB, firstC), false
+        );
+
+        assertEquals(3, actual.size());
+        assertSame(firstA, actual.get(0));
+        assertSame(firstB, actual.get(1));
+        assertSame(firstC, actual.get(2));
+    }
+
+    @Test
+    @DisplayName("Should return surviving distinct entry not original first entry after null removal")
+    void shouldReturnSurvivingDistinctEntryNotOriginalFirstEntryAfterNullRemoval() {
+        NotificationsSummary nullValue = summary(null);
+        NotificationsSummary abc = summary("ABC");
+
+        List<NotificationsSummary> actual = dao.callGetCorrectResults(
+                List.of(nullValue, abc), false
+        );
+
+        assertEquals(1, actual.size());
+        assertSame(abc, actual.get(0));
+    }
+
+    private NotificationsSummary summary(String adviceCode) {
+        NotificationsSummary summary = new NotificationsSummary();
+        summary.setAdviceCode(adviceCode);
+        return summary;
+    }
+
+    /**
+     * Small test subclass to expose protected method.
+     */
+    private static class TestableNotificationsSummaryDaoImp extends NotificationsSummaryDaoImp {
+        List<NotificationsSummary> callGetCorrectResults(List<NotificationsSummary> results, boolean isRetryable) {
+            return getCorrectResults(results, isRetryable);
+        }
+    }
+}
