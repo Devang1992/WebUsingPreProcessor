@@ -1,0 +1,15 @@
+What should change
+
+Replace:
+
+if (distinctMap.size() == 1) {
+    return List.of(results.get(0));
+}
+
+with:
+
+if (distinctMap.size() == 1) {
+    return List.of(distinctMap.values().iterator().next());
+}
+
+That way, if only one distinct value remains after cleanup, you return the actual surviving row.
