@@ -1,0 +1,41 @@
+protected List<NotificationsSummary> getCorrectResults(List<NotificationsSummary> results, boolean isRetryable) {
+    if (results.isEmpty()) {
+        throw new PantsException(
+                PantsErrorCode.DATABASE_ADVICE_RETRIEVAL_ERROR,
+                "No record found for notifications information",
+                isRetryable
+        );
+    }
+
+    if (results.size() == 1) {
+        return List.of(results.get(0));
+    }
+
+    Map<String, NotificationsSummary> distinctMap = new LinkedHashMap<>();
+    boolean hasNonBlankAdvice = false;
+
+    for (NotificationsSummary summary : results) {
+        String adviceCode = summary.getAdviceCode();
+        String trimmed = adviceCode == null ? null : adviceCode.trim();
+        String normalized = (trimmed == null || trimmed.isEmpty()) ? null : trimmed;
+
+        if (normalized != null) {
+            hasNonBlankAdvice = true;
+        }
+
+        distinctMap.putIfAbsent(normalized, summary);
+    }
+
+    if (hasNonBlankAdvice) {
+        distinctMap.remove(null);
+    }
+
+    if (distinctMap.size() == 1) {
+        return List.of(distinctMap.values().iterator().next());
+    }
+
+    return new ArrayList<>(distinctMap.values());
+}
+
+test cases
+Abc def null null ghd null null abc
