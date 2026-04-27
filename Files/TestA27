@@ -1,0 +1,847 @@
+package com.td.pwssp.kafka.merge;
+
+import com.fasterxml.jackson.core.JsonPointer;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.td.pwssp.config.properties.JsonMergeProperties;
+import org.apache.kafka.common.header.Header;
+import org.apache.kafka.common.header.Headers;
+import org.apache.kafka.common.header.internals.RecordHeaders;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.test.util.ReflectionTestUtils;
+
+import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Map;
+
+import static org.assertj.core.api.Assertions.assertThat;
+
+class IsoMergeProcessorTest {
+
+    private static final String HEADER_NAME = "UETR";
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    private TestableIsoMergeProcessor processor;
+    private JsonMergeProperties joinProperties;
+
+    @BeforeEach
+    void setUp() {
+        joinProperties = buildJoinProperties();
+
+        processor = new TestableIsoMergeProcessor();
+
+        /*
+         * This assumes IsoMergeProcessor has a field named joinProperties.
+         * If your field name is different, only change this one string.
+         */
+        ReflectionTestUtils.setField(processor, "joinProperties", joinProperties);
+    }
+
+    @Test
+    void updateTagAndHeader_whenFedAndPacs008_shouldUseUetrAndUpdateMessageTargetCommonTargetAndHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "FED-UETR-123",
+                          "SwiftUETR": "SWIFT-UETR-999"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008",
+                      "FIToFICstmrCdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": {
+                            "UETR": ""
+                          }
+                        }
+                      }
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "ABC",
+                        "Value": "old"
+                      },
+                      {
+                        "Key": "UETR",
+                        "Value": "old-uetr"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/FIToFICstmrCdtTrf/CdtTrfTxInf/PmtId/UETR").asText())
+                .isEqualTo("FED-UETR-123");
+
+        assertThat(root.at("/TDDMessage/TDDQuery/1/Value").asText())
+                .isEqualTo("FED-UETR-123");
+
+        assertHeader(headers, HEADER_NAME, "FED-UETR-123");
+    }
+
+    @Test
+    void updateTagAndHeader_whenBookAndPacs004_shouldUseSwiftUetrAndUpdateCorrectTarget() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "BOOK",
+                        "Id": {
+                          "UETR": "FED-UETR-123",
+                          "SwiftUETR": "SWIFT-UETR-456"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.004",
+                      "PmtRtr": {
+                        "TxInf": {
+                          "OrgnlUETR": ""
+                        }
+                      }
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "UETR",
+                        "Value": "old-value"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/PmtRtr/TxInf/OrgnlUETR").asText())
+                .isEqualTo("SWIFT-UETR-456");
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("SWIFT-UETR-456");
+
+        assertHeader(headers, HEADER_NAME, "SWIFT-UETR-456");
+    }
+
+    @Test
+    void updateTagAndHeader_whenFedAndPacs009_shouldUpdatePacs009Target() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "PACS009-UETR"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.009",
+                      "FICdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": {
+                            "UETR": ""
+                          }
+                        }
+                      }
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "UETR",
+                        "Value": "old"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/FICdtTrf/CdtTrfTxInf/PmtId/UETR").asText())
+                .isEqualTo("PACS009-UETR");
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("PACS009-UETR");
+
+        assertHeader(headers, HEADER_NAME, "PACS009-UETR");
+    }
+
+    @Test
+    void updateTagAndHeader_whenMsgTypeHasNoMapping_shouldNotUpdateJsonAndShouldAddDefaultHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "FED-UETR-123"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.999"
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "UETR",
+                        "Value": "old-value"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("old-value");
+
+        Header header = headers.lastHeader(HEADER_NAME);
+        assertThat(header).isNotNull();
+
+        String headerValue = new String(header.value(), StandardCharsets.UTF_8);
+        assertThat(headerValue).isNotBlank();
+        assertThat(headerValue).isNotEqualTo("FED-UETR-123");
+    }
+
+    @Test
+    void updateTagAndHeader_whenMopHasNoSourcePath_shouldNotUpdateJsonAndShouldAddDefaultHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "WIRE",
+                        "Id": {
+                          "UETR": "FED-UETR-123",
+                          "SwiftUETR": "SWIFT-UETR-456"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008",
+                      "FIToFICstmrCdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": {
+                            "UETR": ""
+                          }
+                        }
+                      }
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "UETR",
+                        "Value": "old"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/FIToFICstmrCdtTrf/CdtTrfTxInf/PmtId/UETR").asText())
+                .isEmpty();
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("old");
+
+        Header header = headers.lastHeader(HEADER_NAME);
+        assertThat(header).isNotNull();
+
+        String headerValue = new String(header.value(), StandardCharsets.UTF_8);
+        assertThat(headerValue).isNotBlank();
+        assertThat(headerValue).isNotEqualTo("FED-UETR-123");
+        assertThat(headerValue).isNotEqualTo("SWIFT-UETR-456");
+    }
+
+    @Test
+    void updateTagAndHeader_whenSourceValueIsMissing_shouldNotUpdateJsonAndShouldAddDefaultHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008",
+                      "FIToFICstmrCdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": {
+                            "UETR": ""
+                          }
+                        }
+                      }
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "UETR",
+                        "Value": "old"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/FIToFICstmrCdtTrf/CdtTrfTxInf/PmtId/UETR").asText())
+                .isEmpty();
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("old");
+
+        Header header = headers.lastHeader(HEADER_NAME);
+        assertThat(header).isNotNull();
+    }
+
+    @Test
+    void updateTagAndHeader_whenSourceValueIsLiteralNull_shouldNotUpdateJsonAndShouldAddDefaultHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "null"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008",
+                      "FIToFICstmrCdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": {
+                            "UETR": ""
+                          }
+                        }
+                      }
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "UETR",
+                        "Value": "old"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/FIToFICstmrCdtTrf/CdtTrfTxInf/PmtId/UETR").asText())
+                .isEmpty();
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("old");
+
+        Header header = headers.lastHeader(HEADER_NAME);
+        assertThat(header).isNotNull();
+
+        String headerValue = new String(header.value(), StandardCharsets.UTF_8);
+        assertThat(headerValue).isNotEqualTo("null");
+    }
+
+    @Test
+    void updateTagAndHeader_whenSourceValueIsEmpty_shouldNotUpdateJsonAndShouldAddDefaultHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": ""
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008",
+                      "FIToFICstmrCdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": {
+                            "UETR": ""
+                          }
+                        }
+                      }
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "UETR",
+                        "Value": "old"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/FIToFICstmrCdtTrf/CdtTrfTxInf/PmtId/UETR").asText())
+                .isEmpty();
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("old");
+
+        Header header = headers.lastHeader(HEADER_NAME);
+        assertThat(header).isNotNull();
+    }
+
+    @Test
+    void updateTagAndHeader_whenCommonTargetArrayMissing_shouldStillUpdateMessageTargetAndHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "FED-UETR-123"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008",
+                      "FIToFICstmrCdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": {
+                            "UETR": ""
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/FIToFICstmrCdtTrf/CdtTrfTxInf/PmtId/UETR").asText())
+                .isEqualTo("FED-UETR-123");
+
+        assertHeader(headers, HEADER_NAME, "FED-UETR-123");
+    }
+
+    @Test
+    void updateTagAndHeader_whenCommonTargetPathIsNotArray_shouldStillUpdateMessageTargetAndHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "FED-UETR-123"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008",
+                      "FIToFICstmrCdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": {
+                            "UETR": ""
+                          }
+                        }
+                      }
+                    },
+                    "TDDQuery": {
+                      "Key": "UETR",
+                      "Value": "old"
+                    }
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/FIToFICstmrCdtTrf/CdtTrfTxInf/PmtId/UETR").asText())
+                .isEqualTo("FED-UETR-123");
+
+        assertThat(root.at("/TDDMessage/TDDQuery/Value").asText())
+                .isEqualTo("old");
+
+        assertHeader(headers, HEADER_NAME, "FED-UETR-123");
+    }
+
+    @Test
+    void updateTagAndHeader_whenCommonTargetArrayHasNoMatchingKey_shouldStillUpdateMessageTargetAndHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "FED-UETR-123"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008",
+                      "FIToFICstmrCdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": {
+                            "UETR": ""
+                          }
+                        }
+                      }
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "OTHER",
+                        "Value": "old"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/FIToFICstmrCdtTrf/CdtTrfTxInf/PmtId/UETR").asText())
+                .isEqualTo("FED-UETR-123");
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("old");
+
+        assertHeader(headers, HEADER_NAME, "FED-UETR-123");
+    }
+
+    @Test
+    void updateTagAndHeader_whenTargetParentMissing_shouldNotThrowAndShouldStillUpdateCommonTargetAndHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "FED-UETR-123"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008"
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "UETR",
+                        "Value": "old"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("FED-UETR-123");
+
+        assertHeader(headers, HEADER_NAME, "FED-UETR-123");
+    }
+
+    @Test
+    void updateTagAndHeader_whenTargetParentIsNotObject_shouldNotThrowAndShouldStillUpdateCommonTargetAndHeader() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "FED-UETR-123"
+                        }
+                      }
+                    },
+                    "TDDMessageBody": {
+                      "x-type": "pacs.008",
+                      "FIToFICstmrCdtTrf": {
+                        "CdtTrfTxInf": {
+                          "PmtId": "not-an-object"
+                        }
+                      }
+                    },
+                    "TDDQuery": [
+                      {
+                        "Key": "UETR",
+                        "Value": "old"
+                      }
+                    ]
+                  }
+                }
+                """);
+
+        Headers headers = new RecordHeaders();
+
+        processor.callUpdateTagAndHeader(root, headers);
+
+        assertThat(root.at("/TDDMessage/TDDQuery/0/Value").asText())
+                .isEqualTo("FED-UETR-123");
+
+        assertHeader(headers, HEADER_NAME, "FED-UETR-123");
+    }
+
+    @Test
+    void resolveSourceValue_whenMopIsFed_shouldReturnUetrValue() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "FED",
+                        "Id": {
+                          "UETR": "FED-UETR-123",
+                          "SwiftUETR": "SWIFT-UETR-456"
+                        }
+                      }
+                    }
+                  }
+                }
+                """);
+
+        String value = processor.callResolveSourceValue(root);
+
+        assertThat(value).isEqualTo("FED-UETR-123");
+    }
+
+    @Test
+    void resolveSourceValue_whenMopIsBook_shouldReturnSwiftUetrValue() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "BOOK",
+                        "Id": {
+                          "UETR": "FED-UETR-123",
+                          "SwiftUETR": "SWIFT-UETR-456"
+                        }
+                      }
+                    }
+                  }
+                }
+                """);
+
+        String value = processor.callResolveSourceValue(root);
+
+        assertThat(value).isEqualTo("SWIFT-UETR-456");
+    }
+
+    @Test
+    void resolveSourceValue_whenMopHasNoConfiguredSource_shouldReturnNull() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMExtended": {
+                      "HVP": {
+                        "Mop": "WIRE",
+                        "Id": {
+                          "UETR": "FED-UETR-123"
+                        }
+                      }
+                    }
+                  }
+                }
+                """);
+
+        String value = processor.callResolveSourceValue(root);
+
+        assertThat(value).isNull();
+    }
+
+    @Test
+    void writeValueAtPath_whenParentExists_shouldWriteValue() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMessageBody": {
+                      "PmtId": {
+                        "UETR": "old"
+                      }
+                    }
+                  }
+                }
+                """);
+
+        processor.callWriteValueAtPath(
+                root,
+                JsonPointer.compile("/TDDMessage/TDDMessageBody/PmtId/UETR"),
+                "new-uetr"
+        );
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/PmtId/UETR").asText())
+                .isEqualTo("new-uetr");
+    }
+
+    @Test
+    void writeValueAtPath_whenParentMissing_shouldNotThrowAndShouldNotCreatePath() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMessageBody": {
+                    }
+                  }
+                }
+                """);
+
+        processor.callWriteValueAtPath(
+                root,
+                JsonPointer.compile("/TDDMessage/TDDMessageBody/PmtId/UETR"),
+                "new-uetr"
+        );
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/PmtId/UETR").isMissingNode())
+                .isTrue();
+    }
+
+    @Test
+    void writeValueAtPath_whenParentIsNotObject_shouldNotThrowAndShouldNotOverwriteParent() throws Exception {
+        JsonNode root = json("""
+                {
+                  "TDDMessage": {
+                    "TDDMessageBody": {
+                      "PmtId": "plain-string"
+                    }
+                  }
+                }
+                """);
+
+        processor.callWriteValueAtPath(
+                root,
+                JsonPointer.compile("/TDDMessage/TDDMessageBody/PmtId/UETR"),
+                "new-uetr"
+        );
+
+        assertThat(root.at("/TDDMessage/TDDMessageBody/PmtId").asText())
+                .isEqualTo("plain-string");
+    }
+
+    private JsonMergeProperties buildJoinProperties() {
+        JsonMergeProperties props = new JsonMergeProperties();
+
+        props.setMerge(JsonPointer.compile("/TDDMessage/TDDMExtended/HVP"));
+        props.setMopTag(JsonPointer.compile("/TDDMessage/TDDMExtended/HVP/Mop"));
+        props.setMsgTypeTag(JsonPointer.compile("/TDDMessage/TDDMessageBody/x-type"));
+
+        props.setMopSourcePaths(Map.of(
+                "FED", JsonPointer.compile("/TDDMessage/TDDMExtended/HVP/Id/UETR"),
+                "BOOK", JsonPointer.compile("/TDDMessage/TDDMExtended/HVP/Id/SwiftUETR")
+        ));
+
+        props.setMsgTypeTargetPaths(Map.of(
+                "pacs.008", List.of(pathTarget("/TDDMessage/TDDMessageBody/FIToFICstmrCdtTrf/CdtTrfTxInf/PmtId/UETR")),
+                "pacs.004", List.of(pathTarget("/TDDMessage/TDDMessageBody/PmtRtr/TxInf/OrgnlUETR")),
+                "pacs.009", List.of(pathTarget("/TDDMessage/TDDMessageBody/FICdtTrf/CdtTrfTxInf/PmtId/UETR"))
+        ));
+
+        props.setCommonTargets(List.of(
+                arrayTarget(
+                        "/TDDMessage/TDDQuery",
+                        "Key",
+                        "UETR",
+                        "Value"
+                )
+        ));
+
+        props.setHeaderName(HEADER_NAME);
+
+        return props;
+    }
+
+    private JsonMergeProperties.TagUpdate pathTarget(String path) {
+        JsonMergeProperties.TagUpdate update = new JsonMergeProperties.TagUpdate();
+        update.setPath(JsonPointer.compile(path));
+        return update;
+    }
+
+    private JsonMergeProperties.TagUpdate arrayTarget(
+            String path,
+            String matchKeyField,
+            String matchKeyValue,
+            String valueField
+    ) {
+        JsonMergeProperties.TagUpdate update = new JsonMergeProperties.TagUpdate();
+        update.setPath(JsonPointer.compile(path));
+        update.setMatchKeyField(matchKeyField);
+        update.setMatchKeyValue(matchKeyValue);
+        update.setValueField(valueField);
+        return update;
+    }
+
+    private JsonNode json(String json) throws Exception {
+        return objectMapper.readTree(json);
+    }
+
+    private void assertHeader(Headers headers, String headerName, String expectedValue) {
+        Header header = headers.lastHeader(headerName);
+
+        assertThat(header)
+                .as("Expected Kafka header '%s' to be present", headerName)
+                .isNotNull();
+
+        assertThat(new String(header.value(), StandardCharsets.UTF_8))
+                .isEqualTo(expectedValue);
+    }
+
+    /**
+     * Test subclass only to expose protected methods.
+     *
+     * If your IsoMergeProcessor has constructor args, add the same constructor here
+     * and call super(...).
+     */
+    private static class TestableIsoMergeProcessor extends IsoMergeProcessor<String> {
+
+        void callUpdateTagAndHeader(JsonNode mergedNode, Headers headers) {
+            updateTagAndHeader(mergedNode, headers);
+        }
+
+        String callResolveSourceValue(JsonNode mergedNode) {
+            return resolveSourceValue(mergedNode);
+        }
+
+        void callWriteValueAtPath(JsonNode root, JsonPointer pointer, String value) {
+            writeValueAtPath(root, pointer, value);
+        }
+    }
+}
