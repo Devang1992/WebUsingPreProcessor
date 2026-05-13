@@ -69,3 +69,118 @@ public void configure(Map<String, ?> properties) {
 
     context.inject(this);
 }
+
+
+-----------------------------
+
+Use this version:
+
+@Bean
+public StreamsBuilderFactoryBeanConfigurer streamsBuilderFactoryBeanCustomizer(
+        @Autowired(required = false) KafkaStreamsTracing kafkaStreamsTracing,
+        DependencyInjector context
+) {
+    return factoryBean -> {
+        Properties existingProperties = factoryBean.getStreamsConfiguration();
+
+        Properties updatedProperties = new Properties();
+
+        if (existingProperties != null) {
+            updatedProperties.putAll(existingProperties);
+        }
+
+        // Main key
+        updatedProperties.put(DependencyInjector.CONTEXT_KEY, context);
+
+        // Producer interceptor key path
+        updatedProperties.put(
+                StreamsConfig.producerPrefix(DependencyInjector.CONTEXT_KEY),
+                context
+        );
+
+        // Consumer interceptor key path
+        updatedProperties.put(
+                StreamsConfig.consumerPrefix(DependencyInjector.CONTEXT_KEY),
+                context
+        );
+
+        factoryBean.setStreamsConfiguration(updatedProperties);
+
+        factoryBean.setKafkaStreamsCustomizer(kafkaStreams -> {
+            kafkaStreams.setUncaughtExceptionHandler(
+                    new CustomUncaughtExceptionHandler()
+            );
+        });
+
+        if (kafkaStreamsTracing != null) {
+            factoryBean.setClientSupplier(kafkaStreamsTracing.kafkaClientSupplier());
+        }
+    };
+}
+
+Imports:
+
+import org.apache.kafka.streams.StreamsConfig;
+import org.springframework.cloud.stream.binder.kafka.streams.StreamsBuilderFactoryBeanConfigurer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.kafka.config.StreamsBuilderFactoryBean;
+
+import java.util.Properties;
+
+Then in your interceptor, read all possible keys:
+
+@Override
+public void configure(Map<String, ?> properties) {
+    Object contextObject = properties.get(DependencyInjector.CONTEXT_KEY);
+
+    if (contextObject == null) {
+        contextObject = properties.get(
+                StreamsConfig.producerPrefix(DependencyInjector.CONTEXT_KEY)
+        );
+    }
+
+    if (contextObject == null) {
+        contextObject = properties.get(
+                StreamsConfig.consumerPrefix(DependencyInjector.CONTEXT_KEY)
+        );
+    }
+
+    if (!(contextObject instanceof DependencyInjector context)) {
+        throw new IllegalStateException(
+                "DependencyInjector not found. Available keys: " + properties.keySet()
+        );
+    }
+
+    context.inject(this);
+}
+
+Also, for your YAML, keep this simplified version:
+
+spring:
+  cloud:
+    stream:
+      kafka:
+        streams:
+          bindings:
+            notificationsConsumer-in-0:
+              consumer:
+                configuration:
+                  interceptor.classes: com.td.payments.pants.kafka.interceptor.HeadersConsumerInterceptor
+              producer:
+                configuration:
+                  interceptor.classes: com.td.payments.pants.kafka.interceptor.HeadersProducerInterceptor
+
+            retryConsumer-in-0:
+              consumer:
+                configuration:
+                  interceptor.classes: com.td.payments.pants.kafka.interceptor.HeadersConsumerInterceptor
+              producer:
+                configuration:
+                  interceptor.classes: com.td.payments.pants.kafka.interceptor.HeadersProducerInterceptor
+
+Main thing: your old code only does properties.put(...). In the upgraded version, I would not trust that mutation to propagate. Create a new Properties, add your keys, and call:
+
+factoryBean.setStreamsConfiguration(updatedProperties);
+
+That is the missing piece I’d try first.
