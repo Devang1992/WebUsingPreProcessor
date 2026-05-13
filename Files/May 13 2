@@ -1,0 +1,71 @@
+What you need to add
+
+Add this config class:
+
+package com.td.payments.pants.kafka.config;
+
+import com.td.payments.pants.kafka.DependencyInjector;
+import lombok.RequiredArgsConstructor;
+import org.apache.kafka.streams.StreamsConfig;
+import org.springframework.cloud.stream.binder.kafka.streams.StreamsBuilderFactoryBeanConfigurer;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.kafka.config.StreamsBuilderFactoryBean;
+
+import java.util.Properties;
+
+@Configuration
+@RequiredArgsConstructor
+public class KafkaStreamsDependencyInjectorConfig {
+
+    private final DependencyInjector dependencyInjector;
+
+    @Bean
+    public StreamsBuilderFactoryBeanConfigurer dependencyInjectorConfigurer() {
+        return factoryBean -> {
+            Properties properties = factoryBean.getStreamsConfiguration();
+
+            properties.put(
+                    DependencyInjector.CONTEXT_KEY,
+                    dependencyInjector
+            );
+
+            properties.put(
+                    StreamsConfig.consumerPrefix(DependencyInjector.CONTEXT_KEY),
+                    dependencyInjector
+            );
+
+            properties.put(
+                    StreamsConfig.producerPrefix(DependencyInjector.CONTEXT_KEY),
+                    dependencyInjector
+            );
+        };
+    }
+}
+
+Then in both interceptors, read all 3 possible keys:
+
+@Override
+public void configure(Map<String, ?> properties) {
+    Object contextObject = properties.get(DependencyInjector.CONTEXT_KEY);
+
+    if (contextObject == null) {
+        contextObject = properties.get(
+                StreamsConfig.consumerPrefix(DependencyInjector.CONTEXT_KEY)
+        );
+    }
+
+    if (contextObject == null) {
+        contextObject = properties.get(
+                StreamsConfig.producerPrefix(DependencyInjector.CONTEXT_KEY)
+        );
+    }
+
+    if (!(contextObject instanceof DependencyInjector context)) {
+        throw new IllegalStateException(
+                "DependencyInjector not found. Available keys: " + properties.keySet()
+        );
+    }
+
+    context.inject(this);
+}
