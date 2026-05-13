@@ -1,0 +1,56 @@
+@Slf4j
+public class HeadersProducerInterceptor implements ProducerInterceptor<String, Object> {
+
+    @Nullable
+    private KafkaHeaderProcessor kafkaHeaderProcessor;
+
+    @Override
+    public ProducerRecord<String, Object> onSend(ProducerRecord<String, Object> producerRecord) {
+        if (producerRecord == null) {
+            return null;
+        }
+
+        KafkaHeaderProcessor processor = kafkaHeaderProcessor;
+        if (processor == null) {
+            throw new IllegalStateException("KafkaHeaderProcessor was not initialized. configure() was not called.");
+        }
+
+        String topic = producerRecord.topic();
+
+        KafkaHeaders.Target target = DynamicTopicNameExtractor.isDltHeaderType(topic)
+                ? KafkaHeaders.Target.DLT
+                : KafkaHeaders.Target.NOTIFICATION;
+
+        processor.clean(producerRecord.headers(), target);
+
+        return producerRecord;
+    }
+
+    @Override
+    public void configure(Map<String, ?> properties) {
+        Object contextObject = properties.get(DependencyInjector.CONTEXT_KEY);
+
+        if (!(contextObject instanceof DependencyInjector context)) {
+            throw new IllegalStateException("DependencyInjector context not found in Kafka producer properties");
+        }
+
+        KafkaHeaderProcessorProperties processorProperties =
+                context.getBean(KafkaHeaderProcessorProperties.class);
+
+        if (processorProperties == null) {
+            throw new IllegalStateException("KafkaHeaderProcessorProperties bean not found in context");
+        }
+
+        this.kafkaHeaderProcessor = new KafkaHeaderProcessor(processorProperties);
+    }
+
+    @Override
+    public void onAcknowledgement(RecordMetadata recordMetadata, Exception e) {
+        // Not used.
+    }
+
+    @Override
+    public void close() {
+        // Not used.
+    }
+}
