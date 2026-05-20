@@ -1,0 +1,36 @@
+import java.text.Normalizer;
+import java.util.regex.Pattern;
+
+public final class LogValueSterilizer {
+
+    private static final Pattern LOG_FORGING_CHARS =
+            Pattern.compile("[\\r\\n\\t\\x00-\\x1F\\x7F]");
+
+    private static final int MAX_LOG_VALUE_LENGTH = 500;
+
+    private LogValueSterilizer() {
+    }
+
+    public static String sterilize(String value) {
+        if (value == null) {
+            return null;
+        }
+
+        String normalized = Normalizer.normalize(value, Normalizer.Form.NFC);
+
+        String cleaned = LOG_FORGING_CHARS
+                .matcher(normalized)
+                .replaceAll("_");
+
+        if (cleaned.length() > MAX_LOG_VALUE_LENGTH) {
+            return cleaned.substring(0, MAX_LOG_VALUE_LENGTH) + "...";
+        }
+
+        return cleaned;
+    }
+}
+
+log.info("Advice not required for given customer, skipped Processing. MID: [{}], AdviceCode: [{}], ProdCode: [{}]",
+        LogValueSterilizer.sterilize(mid),
+        LogValueSterilizer.sterilize(adviceCode),
+        LogValueSterilizer.sterilize(prodCode));
