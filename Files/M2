@@ -1,0 +1,140 @@
+flowchart LR
+
+%% =====================================================
+%% MODERN PANTS NOTIFICATION PROCESSING FLOW
+%% =====================================================
+
+%% -------------------------
+%% STYLES
+%% -------------------------
+classDef source fill:#E0F2FE,stroke:#0284C7,stroke-width:2px,color:#0F172A;
+classDef topic fill:#DBEAFE,stroke:#2563EB,stroke-width:2px,color:#0F172A;
+classDef service fill:#FFF7ED,stroke:#F97316,stroke-width:2px,color:#0F172A;
+classDef process fill:#F8FAFC,stroke:#64748B,stroke-width:1.5px,color:#0F172A;
+classDef decision fill:#FEF3C7,stroke:#D97706,stroke-width:2px,color:#0F172A;
+classDef success fill:#DCFCE7,stroke:#16A34A,stroke-width:2px,color:#0F172A;
+classDef error fill:#FEE2E2,stroke:#DC2626,stroke-width:2px,color:#0F172A;
+classDef retry fill:#F5F3FF,stroke:#7C3AED,stroke-width:2px,color:#0F172A;
+classDef db fill:#ECFDF5,stroke:#059669,stroke-width:2px,color:#0F172A;
+classDef boundary fill:#FFFFFF,stroke:#94A3B8,stroke-width:2px,stroke-dasharray: 8 6,color:#0F172A;
+
+%% -------------------------
+%% PRODUCER AND SOURCE TOPIC
+%% -------------------------
+PWSSP["PWSSP<br/>Stream Processor"]:::source
+SOURCE_TOPIC(["ep_wires_engine_pwssp_pdm_public<br/>Source Topic"]):::topic
+
+PWSSP -->|"Publishes message"| SOURCE_TOPIC
+
+%% -------------------------
+%% PANTS SERVICE BOUNDARY
+%% -------------------------
+subgraph PANTS_BOUNDARY["PANTS Notifications Service"]
+direction TB
+
+    POLL["Poll Kafka topic<br/>Find new message(s)"]:::process
+
+    FILTER_STATUS["Filter message using<br/>Kafka header: STATUS"]:::process
+
+    STATUS_CHECK{"Is STATUS<br/>COMPLETE?"}:::decision
+
+    NO_PROCESS["No further processing"]:::process
+
+    DEDUPE["Deduplicate by MID"]:::process
+
+    DUPLICATE_CHECK{"Is duplicate<br/>message?"}:::decision
+
+    LOG_DUPLICATE["Log duplicate/error<br/>Skip message"]:::error
+
+    STATE_STORE["Store message in<br/>state store for DB query"]:::process
+
+    DB_STATUS_CHECK{"Is DB status<br/>Completed / Advice ready?"}:::decision
+
+    MAX_RETRY_CHECK{"Is max retry<br/>reached?"}:::decision
+
+    DB_QUERY["DB extraction<br/>for Advice Data"]:::db
+
+    DATA_MISSING_CHECK{"Is required<br/>data missing?"}:::decision
+
+    TRANSFORM["Transform and sanitize<br/>notification payload"]:::process
+
+    PROCESSED_MSG["Build processed<br/>PANTS notification"]:::success
+
+end
+
+SOURCE_TOPIC -->|"Kafka Feed"| POLL
+POLL --> FILTER_STATUS
+FILTER_STATUS --> STATUS_CHECK
+
+STATUS_CHECK -->|"No"| NO_PROCESS
+STATUS_CHECK -->|"Yes"| DEDUPE
+
+DEDUPE --> DUPLICATE_CHECK
+DUPLICATE_CHECK -->|"Yes"| LOG_DUPLICATE
+DUPLICATE_CHECK -->|"No"| STATE_STORE
+
+STATE_STORE --> DB_STATUS_CHECK
+DB_STATUS_CHECK -->|"Yes"| DB_QUERY
+DB_STATUS_CHECK -->|"No / DB retry needed"| MAX_RETRY_CHECK
+
+MAX_RETRY_CHECK -->|"No"| STATE_STORE
+MAX_RETRY_CHECK -->|"Yes"| LOG_DB_RETRY
+
+DB_QUERY --> DATA_MISSING_CHECK
+DATA_MISSING_CHECK -->|"Yes"| LOG_DATA_MISSING
+DATA_MISSING_CHECK -->|"No"| TRANSFORM
+
+TRANSFORM --> PROCESSED_MSG
+
+%% -------------------------
+%% ERROR HANDLING AREA
+%% -------------------------
+subgraph ERROR_AREA["Error Handling and Retry Flow"]
+direction TB
+
+    LOG_DB_RETRY["Log DB retry/circuit breaker error"]:::error
+    LOG_DATA_MISSING["Log missing advice data"]:::error
+
+    ERROR_TOPIC(["ep_wires_engine_pants_errors<br/>PANTS Error Topic"]):::topic
+
+    ERROR_CONSUMER["Poll error topic<br/>Find retry messages"]:::retry
+
+    RETRY_CHECK{"Is retry message<br/>exhausted?"}:::decision
+
+    RETRY_TOPIC(["ep_wires_engine_pants_retry<br/>PANTS Retry Topic"]):::retry
+
+    DLQ_TOPIC(["DLQ Topic"]):::error
+
+end
+
+LOG_DUPLICATE --> ERROR_TOPIC
+LOG_DB_RETRY --> ERROR_TOPIC
+LOG_DATA_MISSING --> ERROR_TOPIC
+
+ERROR_TOPIC --> ERROR_CONSUMER
+ERROR_CONSUMER --> RETRY_CHECK
+
+RETRY_CHECK -->|"No<br/>Increment retry counter"| RETRY_TOPIC
+RETRY_TOPIC -->|"Retry Kafka Feed"| POLL
+
+RETRY_CHECK -->|"Yes"| DLQ_TOPIC
+
+%% -------------------------
+%% SUCCESS OUTPUT
+%% -------------------------
+PROCESSED_TOPIC(["ep_wires_engine_pants_processed<br/>PANTS Processed Topic"]):::success
+
+PROCESSED_MSG -->|"Publish processed event"| PROCESSED_TOPIC
+
+%% -------------------------
+%% OPTIONAL DOWNSTREAM
+%% -------------------------
+MAIL_SERVICE["Pants Mail Service<br/>(Adapter)"]:::service
+
+PROCESSED_TOPIC -->|"Kafka Feed"| MAIL_SERVICE
+
+%% -------------------------
+%% APPLY BOUNDARY STYLE
+%% -------------------------
+class PANTS_BOUNDARY boundary
+class ERROR_AREA boundary
